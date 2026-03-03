@@ -94,9 +94,58 @@ Add to your `<activity>` in `AndroidManifest.xml`:
 
 > **Note:** The first time the user plugs in the device, Android will show a popup with "Always open this app" checkbox. Once checked, USB permission is granted automatically.
 
-### iOS / Windows / Linux / macOS
+### Windows
 
-No special setup required. The plugin uses `flutter_recorder` (miniaudio) on these platforms, which handles audio devices natively.
+Uses `flutter_recorder` (miniaudio) for audio capture through the Windows audio driver.
+
+#### Build & Run
+
+```bash
+cd example
+flutter run -d windows
+```
+
+#### Offset Search (Auto)
+
+On Windows, the firmware has been streaming before the app starts capturing, so the XOR keystream position is unknown. The plugin **automatically searches** for the correct offset during the first ~0.5s of capture (ported from the Python `uac_capture_decrypt.py` reference tool).
+
+Debug log will show:
+```
+Offset search: best=NNN, score=0.XXXX
+```
+A score > 0.3 indicates successful alignment.
+
+#### Known Limitation
+
+Windows audio driver receives encrypted PCM from the BMC USB device. Depending on the driver mode (shared vs exclusive), Windows may resample or process the data, which can affect decryption quality. For best results, ensure the BMC device is the only active audio input.
+
+### iOS
+
+Uses `flutter_recorder` (miniaudio) for audio capture via CoreAudio.
+
+#### 1. Microphone Permission
+
+Add to `ios/Runner/Info.plist`:
+
+```xml
+<key>NSMicrophoneUsageDescription</key>
+<string>This app needs microphone access to capture audio from USB devices.</string>
+```
+
+#### 2. Build & Run
+
+```bash
+cd example
+flutter run -d ios
+# Or open in Xcode:
+open ios/Runner.xcworkspace
+```
+
+> **Note:** iOS supports USB audio devices (UAC) through the Lightning/USB-C Camera Adapter. The BMC device appears as a standard audio input.
+
+### Linux / macOS
+
+No special setup required. The plugin uses `flutter_recorder` (miniaudio) on these platforms.
 
 ## API Reference
 
@@ -128,7 +177,7 @@ BmcAudioConfig(
   sampleRate: 16000,  // Hz (default: 16000)
   channels: 1,        // 1=mono, 2=stereo (default: 1)
   decrypt: true,      // Enable XOR decryption (default: true)
-  seed: 0x5A,         // XOR seed (default: 0x5A)
+  seed: 0xC0FFEE12,   // XOR seed (default: 0xC0FFEE12)
 )
 ```
 
@@ -150,14 +199,17 @@ Represents an audio capture device.
 Standalone XOR crypto engine (can be used independently):
 
 ```dart
-final crypto = BmcAudioCrypto(seed: 0x5A);
+final crypto = BmcAudioCrypto(seed: 0xC0FFEE12);
 
-// Decrypt in-place
+// Decrypt PCM16LE buffer in-place
 final encrypted = Uint8List.fromList([...]);
-final decrypted = crypto.process(encrypted);
+crypto.transformPcm16le(encrypted);  // now decrypted
 
-// Reset state
+// Reset keystream position
 crypto.reset();
+
+// One-shot transform (creates copy)
+final decrypted = BmcAudioCrypto.transform(encrypted, seed: 0xC0FFEE12);
 ```
 
 ## How It Works

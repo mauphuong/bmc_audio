@@ -497,10 +497,24 @@ class BmcAudioDecoder {
       _audioSubscription = Recorder.instance.uint8ListStream.listen(
         (data) {
           chunkCount++;
-          if (chunkCount <= 3 || chunkCount % 100 == 0) {
-            _debug('Audio chunk #$chunkCount: ${data.rawData.length} bytes');
+          final rawData = Uint8List.fromList(data.rawData);
+          if (chunkCount <= 5 || chunkCount % 100 == 0) {
+            // Diagnostic: compute min/max/RMS of raw int16 samples
+            int minVal = 32767, maxVal = -32768;
+            double sumSq = 0;
+            final sampleCount = rawData.length ~/ 2;
+            for (int i = 0; i < sampleCount; i++) {
+              int s = rawData[i * 2] | (rawData[i * 2 + 1] << 8);
+              if (s > 32767) s -= 65536;
+              if (s < minVal) minVal = s;
+              if (s > maxVal) maxVal = s;
+              sumSq += s * s;
+            }
+            final rms = sampleCount > 0 ? (sumSq / sampleCount) : 0.0;
+            _debug('Chunk #$chunkCount: ${rawData.length}B, '
+                'min=$minVal max=$maxVal rms=${rms.toStringAsFixed(0)}');
           }
-          _processRawPcm(Uint8List.fromList(data.rawData));
+          _processRawPcm(rawData);
         },
         onError: (error) {
           _debug('Stream error: $error');
