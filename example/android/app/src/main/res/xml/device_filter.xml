@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- BMC S-USB AIO composite device -->
+    <usb-device vendor-id="8137" product-id="279" />
+    <!-- vendor-id = 0x1FC9 = 8137, product-id = 0x0117 = 279 -->
+</resources>
