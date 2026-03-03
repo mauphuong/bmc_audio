@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "../../../USB2025/USB-Audio/SC/bmc/bmc_msc_ccid_hid_uac_bm"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {}
+}
