@@ -17,7 +17,11 @@ class BmcAudioConfig {
   final int channels;
 
   /// Whether to apply XOR decryption to the audio stream.
-  final bool decrypt;
+  ///
+  /// - `null` (default) = **auto-detect**: decrypt if device is BMC, raw otherwise.
+  /// - `true` = always decrypt.
+  /// - `false` = always output raw PCM (no decryption).
+  final bool? decrypt;
 
   /// Encryption seed. Must match firmware `AUDIO_USB_ENCRYPT_SEED`.
   final int seed;
@@ -25,14 +29,14 @@ class BmcAudioConfig {
   const BmcAudioConfig({
     this.sampleRate = 16000,
     this.channels = 1,
-    this.decrypt = true,
+    this.decrypt,
     this.seed = BmcAudioCrypto.defaultSeed,
   });
 
   @override
   String toString() =>
       'BmcAudioConfig(sampleRate: $sampleRate, channels: $channels, '
-      'decrypt: $decrypt, seed: 0x${seed.toRadixString(16).toUpperCase()})';
+      'decrypt: ${decrypt ?? "auto"}, seed: 0x${seed.toRadixString(16).toUpperCase()})';
 }
 
 /// Capture state of the decoder.
@@ -96,6 +100,9 @@ class BmcAudioDecoder {
 
   /// Whether the recorder has been initialized (non-Android only).
   bool _recorderInitialized = false;
+
+  /// Resolved decrypt state (set in startCapture, used by _processRawPcm).
+  bool _resolvedDecrypt = false;
 
   /// Offset search state (for non-Android platforms)
   bool _offsetFound = false;
@@ -297,6 +304,9 @@ class BmcAudioDecoder {
   }
 
   /// Auto-detect a BMC USB device from available capture devices.
+  ///
+  /// Returns a BMC device if found, otherwise a USB device, otherwise `null`.
+  /// For a method that also falls back to the default mic, use [findBestDevice].
   Future<BmcAudioDevice?> findBmcDevice() async {
     final devices = await listDevices();
     for (final device in devices) {
@@ -306,6 +316,28 @@ class BmcAudioDecoder {
       if (device.isUsb) return device;
     }
     return null;
+  }
+
+  /// Find the best available audio device with priority: BMC > USB > default mic.
+  ///
+  /// Unlike [findBmcDevice], this always returns a device if any are available.
+  /// Combined with auto-decrypt (`BmcAudioConfig(decrypt: null)`), this provides
+  /// a zero-config experience:
+  /// - BMC device → automatically decrypted audio
+  /// - Non-BMC device → raw audio
+  ///
+  /// ```dart
+  /// final device = await decoder.findBestDevice();
+  /// if (device != null) {
+  ///   final stream = decoder.startCapture(device: device);
+  ///   // Audio is automatically decrypted if BMC, raw if default mic
+  /// }
+  /// ```
+  Future<BmcAudioDevice?> findBestDevice() async {
+    final devices = await listDevices();
+    return devices.where((d) => d.isBmc).firstOrNull ??
+        devices.where((d) => d.isUsb).firstOrNull ??
+        devices.firstOrNull;
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -334,6 +366,17 @@ class BmcAudioDecoder {
       _config = config;
     }
 
+    // Resolve auto-decrypt: null → based on device type
+    final bool shouldDecrypt;
+    if (_config.decrypt != null) {
+      shouldDecrypt = _config.decrypt!;
+      _debug('Decrypt: ${shouldDecrypt ? "ON" : "OFF"} (explicit)');
+    } else {
+      // Auto-detect: decrypt if BMC device, raw otherwise
+      shouldDecrypt = device?.isBmc ?? false;
+      _debug('Auto-decrypt: ${shouldDecrypt ? "ON (BMC device)" : "OFF (non-BMC device)"}');
+    }
+
     _state = BmcCaptureState.initializing;
 
     _outputController = StreamController<Uint8List>.broadcast(
@@ -344,10 +387,16 @@ class BmcAudioDecoder {
       },
     );
 
-    if (_config.decrypt) {
+    if (shouldDecrypt) {
       _crypto = BmcAudioCrypto(seed: _config.seed);
       _debug('Crypto enabled (seed=0x${_config.seed.toRadixString(16)})');
+    } else {
+      _crypto = null;
+      _debug('Crypto disabled — outputting raw PCM');
     }
+
+    // Store resolved decrypt state for _processRawPcm
+    _resolvedDecrypt = shouldDecrypt;
 
     // Reset offset search state
     _offsetFound = _isAndroid; // Android USB Direct starts at offset 0
@@ -551,7 +600,7 @@ class BmcAudioDecoder {
     if (_state != BmcCaptureState.capturing) return;
 
     try {
-      if (_config.decrypt && _crypto != null) {
+      if (_resolvedDecrypt && _crypto != null) {
         // On Android USB Direct: offset is always 0 (we read from stream start)
         // On other platforms: need offset search
         if (!_isAndroid && !_offsetFound) {
@@ -636,6 +685,9 @@ class BmcAudioDecoder {
   }
 
   /// Update configuration while capturing.
+  ///
+  /// Pass [decrypt] to explicitly enable/disable decryption mid-capture.
+  /// This overrides auto-detect mode.
   void updateConfig({bool? decrypt, int? seed}) {
     if (decrypt != null) {
       _config = BmcAudioConfig(
@@ -645,10 +697,13 @@ class BmcAudioDecoder {
         seed: seed ?? _config.seed,
       );
 
+      _resolvedDecrypt = decrypt;
       if (decrypt && _crypto == null) {
         _crypto = BmcAudioCrypto(seed: _config.seed);
+        _debug('Crypto enabled (manual override)');
       } else if (!decrypt) {
         _crypto = null;
+        _debug('Crypto disabled (manual override)');
       }
     }
 

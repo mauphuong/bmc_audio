@@ -49,6 +49,7 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
   BmcAudioDevice? _selectedDevice;
   bool _isCapturing = false;
   bool _decryptEnabled = true;
+  bool _userOverrideDecrypt = false; // true when user manually toggles XOR
 
   // Debug log (shown on screen since USB is occupied by device)
   final List<String> _debugLog = [];
@@ -184,9 +185,15 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
         _selectedDevice = devices.where((d) => d.isBmc).firstOrNull ??
             devices.where((d) => d.isUsb).firstOrNull ??
             (devices.isNotEmpty ? devices.first : null);
+
+        // Auto-set decrypt based on device type (unless user has manually toggled)
+        if (!_userOverrideDecrypt && _selectedDevice != null) {
+          _decryptEnabled = _selectedDevice!.isBmc;
+        }
       });
       if (_selectedDevice != null) {
         _log('Auto-selected: "${_selectedDevice!.name}"');
+        _log('Auto-decrypt: ${_decryptEnabled ? "ON (BMC device)" : "OFF (non-BMC device)"}');
       }
     } catch (e) {
       _log('ERROR: $e');
@@ -208,7 +215,9 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
         config: BmcAudioConfig(
           sampleRate: 16000,
           channels: 1,
-          decrypt: _decryptEnabled,
+          // null = auto (BMC → decrypt, non-BMC → raw)
+          // explicit true/false when user has manually toggled
+          decrypt: _userOverrideDecrypt ? _decryptEnabled : null,
         ),
       );
 
@@ -411,6 +420,7 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
   void _toggleDecrypt() {
     setState(() {
       _decryptEnabled = !_decryptEnabled;
+      _userOverrideDecrypt = true; // user explicitly chose
     });
 
     if (_isCapturing) {
@@ -548,7 +558,17 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
                 }).toList(),
                 onChanged: _isCapturing
                     ? null
-                    : (device) => setState(() => _selectedDevice = device),
+                    : (device) {
+                        setState(() {
+                          _selectedDevice = device;
+                          // Auto-update decrypt based on new device (reset manual override)
+                          if (device != null) {
+                            _userOverrideDecrypt = false;
+                            _decryptEnabled = device.isBmc;
+                            _log('Device changed: "${device.name}" → decrypt=${_decryptEnabled ? "ON" : "OFF"}');
+                          }
+                        });
+                      },
               ),
           ],
         ),
