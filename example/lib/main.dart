@@ -387,6 +387,12 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
 
       _log('Playing: $_savedWavPath');
 
+      // Stop capture before playback to release audio session on iOS
+      if (_isCapturing) {
+        _log('Stopping capture for playback...');
+        await _stopCapture();
+      }
+
       if (defaultTargetPlatform == TargetPlatform.windows) {
         // Windows: open with system default player
         await Process.start('cmd', ['/c', 'start', '', _savedWavPath!]);

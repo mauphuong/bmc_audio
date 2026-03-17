@@ -1,0 +1,60 @@
+PODS:
+  - audio_session (0.0.1):
+    - Flutter
+  - bmc_audio (0.0.1):
+    - Flutter
+  - Flutter (1.0.0)
+  - flutter_recorder (0.0.1):
+    - Flutter
+  - integration_test (0.0.1):
+    - Flutter
+  - just_audio (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - path_provider_foundation (0.0.1):
+    - Flutter
+    - FlutterMacOS
+  - permission_handler_apple (9.3.0):
+    - Flutter
+
+DEPENDENCIES:
+  - audio_session (from `.symlinks/plugins/audio_session/ios`)
+  - bmc_audio (from `.symlinks/plugins/bmc_audio/ios`)
+  - Flutter (from `Flutter`)
+  - flutter_recorder (from `.symlinks/plugins/flutter_recorder/ios`)
+  - integration_test (from `.symlinks/plugins/integration_test/ios`)
+  - just_audio (from `.symlinks/plugins/just_audio/darwin`)
+  - path_provider_foundation (from `.symlinks/plugins/path_provider_foundation/darwin`)
+  - permission_handler_apple (from `.symlinks/plugins/permission_handler_apple/ios`)
+
+EXTERNAL SOURCES:
+  audio_session:
+    :path: ".symlinks/plugins/audio_session/ios"
+  bmc_audio:
+    :path: ".symlinks/plugins/bmc_audio/ios"
+  Flutter:
+    :path: Flutter
+  flutter_recorder:
+    :path: ".symlinks/plugins/flutter_recorder/ios"
+  integration_test:
+    :path: ".symlinks/plugins/integration_test/ios"
+  just_audio:
+    :path: ".symlinks/plugins/just_audio/darwin"
+  path_provider_foundation:
+    :path: ".symlinks/plugins/path_provider_foundation/darwin"
+  permission_handler_apple:
+    :path: ".symlinks/plugins/permission_handler_apple/ios"
+
+SPEC CHECKSUMS:
+  audio_session: 9bb7f6c970f21241b19f5a3658097ae459681ba0
+  bmc_audio: 81cd737f14f964c521705e08975a258dfe500d88
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  flutter_recorder: f976cf27301f5ba68959c7e87a3e4c8c1ccd4e8d
+  integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
+  just_audio: 4e391f57b79cad2b0674030a00453ca5ce817eed
+  path_provider_foundation: 080d55be775b7414fd5a5ef3ac137b97b097e564
+  permission_handler_apple: 4ed2196e43d0651e8ff7ca3483a069d469701f2d
+
+PODFILE CHECKSUM: 66e4d5b74f90ecc5365701deefeba23c3bdd85b1
+
+COCOAPODS: 1.16.2
