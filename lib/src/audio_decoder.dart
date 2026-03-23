@@ -109,8 +109,8 @@ class BmcAudioDecoder {
   final List<Uint8List> _offsetSearchBuffer = [];
   int _offsetSearchBytes = 0;
 
-  /// Minimum bytes to collect before running offset search (~0.5s at 16kHz mono 16-bit)
-  static const int _offsetSearchMinBytes = 16000;
+  /// Minimum bytes to collect before running offset search (~1s at 16kHz mono 16-bit)
+  static const int _offsetSearchMinBytes = 32000;
 
   /// Optional debug callback — called with status messages.
   void Function(String message)? onDebug;
@@ -181,15 +181,17 @@ class BmcAudioDecoder {
       return _listDevicesAndroid(usbOnly: usbOnly);
     } else if (_isIOS) {
       return _listDevicesIOS(usbOnly: usbOnly);
+    if (_isNativePlatform) {
+      return _listDevicesNative(usbOnly: usbOnly);
     } else {
       return _listDevicesDesktop(usbOnly: usbOnly);
     }
   }
 
-  /// Android: list devices via native platform channel.
-  /// Merges AudioManager devices + UsbManager audio-class devices
-  /// (for composite USB devices that Android HAL doesn't recognize).
-  Future<List<BmcAudioDevice>> _listDevicesAndroid(
+  /// Android/iOS: list devices via native platform channel.
+  /// On Android: merges AudioManager + UsbManager devices.
+  /// On iOS: uses AVAudioSession.availableInputs.
+  Future<List<BmcAudioDevice>> _listDevicesNative(
       {bool usbOnly = false}) async {
     try {
       final result = <BmcAudioDevice>[];
@@ -227,8 +229,10 @@ class BmcAudioDecoder {
         }
       }
 
-      // 2. UsbManager devices (hardware USB — for composite devices)
+      // 2. UsbManager devices (Android only — for composite USB devices)
       // Add USB audio-class devices NOT already in AudioManager
+      if (!_isAndroid) return result;
+
       final bool hasUsbAudioInManager = result.any((d) => d.isUsb);
 
       final List<dynamic> usbDevices =
@@ -470,14 +474,17 @@ class BmcAudioDecoder {
     return _outputController!.stream;
   }
 
-  /// Android: start capture — auto-selects USB direct or AudioRecord.
-  Future<void> _startCaptureAndroid({
+  /// Android/iOS: start capture via native MethodChannel.
+  /// On Android: auto-selects USB direct or AudioRecord.
+  /// On iOS: uses AVAudioEngine via native plugin.
+  Future<void> _startCaptureNative({
     String? deviceId,
     BmcAudioDevice? device,
   }) async {
     try {
-      // Determine if this is a USB-direct device (composite, not in AudioManager)
-      final bool isUsbDirect = device?.vendorId != null && device?.productId != null;
+      // Determine if this is a USB-direct device (Android composite, not in AudioManager)
+      final bool isUsbDirect = _isAndroid &&
+          device?.vendorId != null && device?.productId != null;
 
       if (isUsbDirect) {
         _debug('Android: USB Direct capture mode');
@@ -521,8 +528,8 @@ class BmcAudioDecoder {
           _debug('  maxPacketSize=${captureResult['maxPacketSize']}');
         }
       } else {
-        // Standard AudioRecord capture
-        _debug('Android: AudioRecord capture mode');
+        // Standard capture (AudioRecord on Android, AVAudioEngine on iOS)
+        _debug('${_isAndroid ? "Android" : "iOS"}: Native capture mode');
 
         final int? parsedDeviceId = deviceId != null
             ? int.tryParse(deviceId)
@@ -537,10 +544,10 @@ class BmcAudioDecoder {
         });
 
         _state = BmcCaptureState.capturing;
-        _debug('✓ AudioRecord capture started');
+        _debug('✓ Native capture started');
       }
     } catch (e, stack) {
-      _debug('FAILED to start Android capture: $e');
+      _debug('FAILED to start native capture: $e');
       _debug('Stack: ${stack.toString().split('\n').take(3).join(' | ')}');
       _state = BmcCaptureState.idle;
       _outputController?.addError(e);
@@ -758,6 +765,8 @@ class BmcAudioDecoder {
         try {
           Recorder.instance.stopStreamingData();
           Recorder.instance.stop();
+          Recorder.instance.deinit();
+          _recorderInitialized = false;
         } catch (_) {}
       }
 

@@ -14,6 +14,13 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private static let eventChannelName = "bmc_audio/audio_stream"
 
     // MARK: - Flutter channels
+/// BmcAudioPlugin — Native iOS audio capture with USB device support.
+///
+/// Two capture modes:
+/// 1. AVAudioEngine (standard): Goes through CoreAudio
+/// 2. USB Direct (IOKit via BmcUsbHelper): Reads raw USB isochronous data
+public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
+
     private var methodChannel: FlutterMethodChannel?
     private var eventChannel: FlutterEventChannel?
     private var eventSink: FlutterEventSink?
@@ -72,12 +79,25 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             let channels = args?["channels"] as? Int ?? 1
             startCapture(sampleRate: sampleRate, channels: channels, result: result)
 
+        case "isCapturing":
+            result(isCapturing)
+            let deviceId = args?["deviceId"] as? Int
+            startCapture(deviceId: deviceId, sampleRate: sampleRate,
+                         channels: channels, result: result)
+
+        case "startUsbCapture":
+            let args = call.arguments as? [String: Any]
+            let vid = args?["vendorId"] as? Int ?? 0x1fc9
+            let pid = args?["productId"] as? Int ?? 0x0117
+            startUsbDirectCapture(vid: UInt16(vid), pid: UInt16(pid), result: result)
+
         case "stopCapture":
             stopCapture()
+            BmcUsbHelper.stopIsocCapture()
             result(nil)
 
         case "isCapturing":
-            result(isCapturing)
+            result(isCapturing || BmcUsbHelper.isCapturing())
 
         default:
             result(FlutterMethodNotImplemented)
