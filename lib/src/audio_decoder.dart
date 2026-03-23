@@ -124,6 +124,18 @@ class BmcAudioDecoder {
     }
   }
 
+  /// Whether we're running on iOS.
+  bool get _isIOS {
+    try {
+      return !kIsWeb && Platform.isIOS;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Whether we're running on a platform with native plugin (Android or iOS).
+  bool get _hasNativePlugin => _isAndroid || _isIOS;
+
   /// Create a decoder with default or custom configuration.
   BmcAudioDecoder({BmcAudioConfig? config})
       : _config = config ?? const BmcAudioConfig();
@@ -162,10 +174,13 @@ class BmcAudioDecoder {
   /// List available audio capture devices.
   ///
   /// On Android: uses native AudioManager.getDevices() — shows USB devices.
+  /// On iOS: uses native AVAudioSession — shows USB audio ports.
   /// On other platforms: uses flutter_recorder (miniaudio).
   Future<List<BmcAudioDevice>> listDevices({bool usbOnly = false}) async {
     if (_isAndroid) {
       return _listDevicesAndroid(usbOnly: usbOnly);
+    } else if (_isIOS) {
+      return _listDevicesIOS(usbOnly: usbOnly);
     } else {
       return _listDevicesDesktop(usbOnly: usbOnly);
     }
@@ -263,7 +278,46 @@ class BmcAudioDecoder {
     }
   }
 
-  /// Desktop/iOS: list devices via flutter_recorder.
+  /// iOS: list devices via native AVAudioSession.
+  Future<List<BmcAudioDevice>> _listDevicesIOS(
+      {bool usbOnly = false}) async {
+    try {
+      final List<dynamic> audioDevices =
+          await _methodChannel.invokeMethod('listDevices') ?? [];
+
+      _debug('iOS: ${audioDevices.length} input ports');
+
+      final result = <BmcAudioDevice>[];
+      for (final raw in audioDevices) {
+        final map = Map<String, dynamic>.from(raw as Map);
+        final id = map['id']?.toString() ?? '0';
+        final name = map['name']?.toString() ?? 'Unknown';
+        final isUsb = map['isUsb'] as bool? ?? false;
+        final isBmc = map['isBmc'] as bool? ?? false;
+        final productName = map['productName']?.toString() ?? '';
+
+        final device = BmcAudioDevice(
+          id: id,
+          name: productName.isNotEmpty ? productName : name,
+          isUsb: isUsb,
+          isBmc: isBmc,
+        );
+
+        _debug('  [$id] "${device.name}" usb=$isUsb bmc=$isBmc');
+
+        if (!usbOnly || device.isUsb) {
+          result.add(device);
+        }
+      }
+
+      return result;
+    } catch (e) {
+      _debug('Error listing iOS devices: $e');
+      return [];
+    }
+  }
+
+  /// Desktop: list devices via flutter_recorder.
   Future<List<BmcAudioDevice>> _listDevicesDesktop(
       {bool usbOnly = false}) async {
     try {
@@ -398,13 +452,17 @@ class BmcAudioDecoder {
     // Store resolved decrypt state for _processRawPcm
     _resolvedDecrypt = shouldDecrypt;
 
-    // Reset offset search state
-    _offsetFound = _isAndroid; // Android USB Direct starts at offset 0
+    // Reset offset search state — always search on all platforms.
+    // Even on Android USB Direct, the firmware primes 2 packets before
+    // the app starts reading, so sampleIndex may not be 0.
+    _offsetFound = false;
     _offsetSearchBuffer.clear();
     _offsetSearchBytes = 0;
 
     if (_isAndroid) {
       _startCaptureAndroid(deviceId: deviceId, device: device);
+    } else if (_isIOS) {
+      _startCaptureIOS(deviceId: deviceId ?? device?.id);
     } else {
       _startCaptureDesktop(deviceId ?? device?.id);
     }
@@ -513,7 +571,41 @@ class BmcAudioDecoder {
     );
   }
 
-  /// Desktop/iOS: start capture via flutter_recorder.
+  /// iOS: start capture via native AVAudioEngine plugin.
+  Future<void> _startCaptureIOS({String? deviceId}) async {
+    try {
+      _debug('iOS: Starting native AVAudioEngine capture');
+
+      _setupEventChannelListener();
+
+      final captureResult = await _methodChannel.invokeMethod('startCapture', {
+        'sampleRate': _config.sampleRate,
+        'channels': _config.channels,
+      });
+
+      _state = BmcCaptureState.capturing;
+      _debug('✓ iOS capture started');
+
+      if (captureResult is Map) {
+        final hwRate = captureResult['hardwareSampleRate'] as double?;
+        final rateMatch = captureResult['rateMatch'] as bool? ?? false;
+        _debug('  hardwareSampleRate=$hwRate, rateMatch=$rateMatch');
+
+        if (!rateMatch) {
+          _debug('⚠️ iOS hardware rate ($hwRate) != requested (${_config.sampleRate})');
+          _debug('XOR decryption may produce noise due to resampling!');
+        }
+      }
+    } catch (e, stack) {
+      _debug('FAILED to start iOS capture: $e');
+      _debug('Stack: ${stack.toString().split('\n').take(3).join(' | ')}');
+      _state = BmcCaptureState.idle;
+      _outputController?.addError(e);
+      _outputController?.close();
+    }
+  }
+
+  /// Desktop: start capture via flutter_recorder.
   Future<void> _startCaptureDesktop(String? deviceId) async {
     try {
       if (_recorderInitialized) {
@@ -593,17 +685,16 @@ class BmcAudioDecoder {
 
   /// Process raw PCM16LE data: decrypt if enabled, forward to output stream.
   ///
-  /// On non-Android platforms, the first chunks are buffered for offset search
-  /// to find the correct keystream position (since capture starts at an
-  /// unknown firmware sample position).
+  /// The first ~0.5s of audio is buffered for offset search to find the
+  /// correct keystream position. This is needed on all platforms because
+  /// the firmware may have sent samples before the app starts reading
+  /// (e.g. priming packets, HAL buffering, etc.).
   void _processRawPcm(Uint8List rawPcm) {
     if (_state != BmcCaptureState.capturing) return;
 
     try {
       if (_resolvedDecrypt && _crypto != null) {
-        // On Android USB Direct: offset is always 0 (we read from stream start)
-        // On other platforms: need offset search
-        if (!_isAndroid && !_offsetFound) {
+        if (!_offsetFound) {
           // Buffer data for offset search
           _offsetSearchBuffer.add(Uint8List.fromList(rawPcm));
           _offsetSearchBytes += rawPcm.length;
@@ -659,9 +750,11 @@ class BmcAudioDecoder {
     _state = BmcCaptureState.stopping;
 
     try {
-      if (_isAndroid) {
+      if (_hasNativePlugin) {
+        // Android and iOS: stop via native plugin
         await _methodChannel.invokeMethod('stopCapture');
       } else {
+        // Desktop: stop flutter_recorder
         try {
           Recorder.instance.stopStreamingData();
           Recorder.instance.stop();
@@ -718,7 +811,7 @@ class BmcAudioDecoder {
       stopCapture();
     }
 
-    if (!_isAndroid && _recorderInitialized) {
+    if (!_hasNativePlugin && _recorderInitialized) {
       try {
         Recorder.instance.deinit();
       } catch (_) {}

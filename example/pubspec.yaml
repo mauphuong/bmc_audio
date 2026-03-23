@@ -1,5 +1,6 @@
 name: bmc_audio_example
 description: "Demonstrates how to use the bmc_audio plugin."
+version: 1.0.0+1
 publish_to: 'none'
 
 environment:
