@@ -2,11 +2,11 @@ import Flutter
 import UIKit
 import AVFoundation
 
-/// BMC Audio Plugin — Native iOS audio capture using AVAudioEngine.
+/// BmcAudioPlugin — Native iOS audio capture with USB device support.
 ///
-/// Uses AVAudioEngine to capture audio at the hardware's native format,
-/// avoiding Core Audio resampling that would destroy XOR-encrypted PCM data
-/// from the BMC USB Audio device.
+/// Two capture modes:
+/// 1. AVAudioEngine (standard): Goes through CoreAudio
+/// 2. USB Direct (IOKit via BmcUsbHelper): Reads raw USB isochronous data (future)
 public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
     // MARK: - Constants
@@ -14,13 +14,6 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private static let eventChannelName = "bmc_audio/audio_stream"
 
     // MARK: - Flutter channels
-/// BmcAudioPlugin — Native iOS audio capture with USB device support.
-///
-/// Two capture modes:
-/// 1. AVAudioEngine (standard): Goes through CoreAudio
-/// 2. USB Direct (IOKit via BmcUsbHelper): Reads raw USB isochronous data
-public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
-
     private var methodChannel: FlutterMethodChannel?
     private var eventChannel: FlutterEventChannel?
     private var eventSink: FlutterEventSink?
@@ -66,6 +59,8 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
     // MARK: - FlutterPlugin
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+        let args = call.arguments as? [String: Any]
+
         switch call.method {
         case "getPlatformVersion":
             result("iOS " + UIDevice.current.systemVersion)
@@ -74,30 +69,18 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             result(listAudioDevices())
 
         case "startCapture":
-            let args = call.arguments as? [String: Any]
             let sampleRate = args?["sampleRate"] as? Int ?? 16000
             let channels = args?["channels"] as? Int ?? 1
-            startCapture(sampleRate: sampleRate, channels: channels, result: result)
-
-        case "isCapturing":
-            result(isCapturing)
             let deviceId = args?["deviceId"] as? Int
             startCapture(deviceId: deviceId, sampleRate: sampleRate,
                          channels: channels, result: result)
 
-        case "startUsbCapture":
-            let args = call.arguments as? [String: Any]
-            let vid = args?["vendorId"] as? Int ?? 0x1fc9
-            let pid = args?["productId"] as? Int ?? 0x0117
-            startUsbDirectCapture(vid: UInt16(vid), pid: UInt16(pid), result: result)
-
         case "stopCapture":
             stopCapture()
-            BmcUsbHelper.stopIsocCapture()
             result(nil)
 
         case "isCapturing":
-            result(isCapturing || BmcUsbHelper.isCapturing())
+            result(isCapturing)
 
         default:
             result(FlutterMethodNotImplemented)
@@ -151,7 +134,8 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
     // MARK: - Audio Capture
 
-    private func startCapture(sampleRate: Int, channels: Int, result: @escaping FlutterResult) {
+    private func startCapture(deviceId: Int?, sampleRate: Int, channels: Int,
+                              result: @escaping FlutterResult) {
         if isCapturing {
             result(FlutterError(code: "ALREADY_CAPTURING",
                                 message: "Already capturing", details: nil))
@@ -175,9 +159,18 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                 // Prefer BMC device, then any USB, then default
                 let bmcPort = availableInputs.first { looksLikeBmc(name: $0.portName) }
                 let usbPort = availableInputs.first { $0.portType == .usbAudio }
-                if let preferredPort = bmcPort ?? usbPort {
-                    try session.setPreferredInput(preferredPort)
-                    NSLog("BmcAudioPlugin: Selected input: \(preferredPort.portName)")
+
+                // If deviceId specified, try to match by index
+                var preferredPort: AVAudioSessionPortDescription? = nil
+                if let deviceId = deviceId, deviceId < availableInputs.count {
+                    preferredPort = availableInputs[deviceId]
+                } else {
+                    preferredPort = bmcPort ?? usbPort
+                }
+
+                if let port = preferredPort {
+                    try session.setPreferredInput(port)
+                    NSLog("BmcAudioPlugin: Selected input: \(port.portName)")
                 }
             }
 
@@ -207,38 +200,10 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
             NSLog("BmcAudioPlugin: Output format: rate=\(outputFormat.sampleRate), channels=\(outputFormat.channelCount), int16le")
 
-            // 6. If hardware rate != requested rate, we need a converter
-            //    This is for the case where iOS forces 48kHz
-            var converter: AVAudioConverter? = nil
+            // 6. If hardware rate != requested rate, log warning
             if abs(hwFormat.sampleRate - Double(sampleRate)) > 1.0 {
-                // Hardware rate is different from requested — need to convert
-                // First, create an intermediate format at hardware rate with Int16
-                guard let hwInt16Format = AVAudioFormat(
-                    commonFormat: .pcmFormatInt16,
-                    sampleRate: hwFormat.sampleRate,
-                    channels: AVAudioChannelCount(channels),
-                    interleaved: true
-                ) else {
-                    result(FlutterError(code: "FORMAT_ERROR",
-                                        message: "Failed to create hw int16 format", details: nil))
-                    return
-                }
-
-                // Create target format at requested sample rate
-                guard let targetFormat = AVAudioFormat(
-                    commonFormat: .pcmFormatInt16,
-                    sampleRate: Double(sampleRate),
-                    channels: AVAudioChannelCount(channels),
-                    interleaved: true
-                ) else {
-                    result(FlutterError(code: "FORMAT_ERROR",
-                                        message: "Failed to create target format", details: nil))
-                    return
-                }
-
-                converter = AVAudioConverter(from: hwInt16Format, to: targetFormat)
-                NSLog("BmcAudioPlugin: ⚠️ Hardware rate (\(hwFormat.sampleRate)) != requested (\(sampleRate)). Converter active — XOR decrypt may not work!")
-                actualSampleRate = Double(sampleRate)
+                NSLog("BmcAudioPlugin: ⚠️ Hardware rate (\(hwFormat.sampleRate)) != requested (\(sampleRate)). XOR decrypt may not work!")
+                actualSampleRate = hwFormat.sampleRate
             }
 
             // 7. Install tap on input node
@@ -253,7 +218,6 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
                 // Get the Int16 data from the buffer
                 guard let int16Data = buffer.int16ChannelData else {
-                    // Fallback: if Int16 channel data not available, try float and convert
                     NSLog("BmcAudioPlugin: No int16 channel data available")
                     return
                 }
@@ -262,7 +226,7 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                 let channelCount = Int(buffer.format.channelCount)
                 let byteCount = frameCount * channelCount * 2 // 2 bytes per Int16 sample
 
-                // Create Data from Int16 samples (already in LE on ARM/x86)
+                // Create Data from Int16 samples (already in LE on ARM)
                 let data = Data(bytes: int16Data[0], count: byteCount)
                 let flutterData = FlutterStandardTypedData(bytes: data)
 

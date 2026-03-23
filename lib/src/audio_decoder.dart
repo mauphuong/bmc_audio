@@ -177,11 +177,7 @@ class BmcAudioDecoder {
   /// On iOS: uses native AVAudioSession — shows USB audio ports.
   /// On other platforms: uses flutter_recorder (miniaudio).
   Future<List<BmcAudioDevice>> listDevices({bool usbOnly = false}) async {
-    if (_isAndroid) {
-      return _listDevicesAndroid(usbOnly: usbOnly);
-    } else if (_isIOS) {
-      return _listDevicesIOS(usbOnly: usbOnly);
-    if (_isNativePlatform) {
+    if (_hasNativePlugin) {
       return _listDevicesNative(usbOnly: usbOnly);
     } else {
       return _listDevicesDesktop(usbOnly: usbOnly);
@@ -282,44 +278,6 @@ class BmcAudioDecoder {
     }
   }
 
-  /// iOS: list devices via native AVAudioSession.
-  Future<List<BmcAudioDevice>> _listDevicesIOS(
-      {bool usbOnly = false}) async {
-    try {
-      final List<dynamic> audioDevices =
-          await _methodChannel.invokeMethod('listDevices') ?? [];
-
-      _debug('iOS: ${audioDevices.length} input ports');
-
-      final result = <BmcAudioDevice>[];
-      for (final raw in audioDevices) {
-        final map = Map<String, dynamic>.from(raw as Map);
-        final id = map['id']?.toString() ?? '0';
-        final name = map['name']?.toString() ?? 'Unknown';
-        final isUsb = map['isUsb'] as bool? ?? false;
-        final isBmc = map['isBmc'] as bool? ?? false;
-        final productName = map['productName']?.toString() ?? '';
-
-        final device = BmcAudioDevice(
-          id: id,
-          name: productName.isNotEmpty ? productName : name,
-          isUsb: isUsb,
-          isBmc: isBmc,
-        );
-
-        _debug('  [$id] "${device.name}" usb=$isUsb bmc=$isBmc');
-
-        if (!usbOnly || device.isUsb) {
-          result.add(device);
-        }
-      }
-
-      return result;
-    } catch (e) {
-      _debug('Error listing iOS devices: $e');
-      return [];
-    }
-  }
 
   /// Desktop: list devices via flutter_recorder.
   Future<List<BmcAudioDevice>> _listDevicesDesktop(
@@ -463,10 +421,8 @@ class BmcAudioDecoder {
     _offsetSearchBuffer.clear();
     _offsetSearchBytes = 0;
 
-    if (_isAndroid) {
-      _startCaptureAndroid(deviceId: deviceId, device: device);
-    } else if (_isIOS) {
-      _startCaptureIOS(deviceId: deviceId ?? device?.id);
+    if (_hasNativePlugin) {
+      _startCaptureNative(deviceId: deviceId, device: device);
     } else {
       _startCaptureDesktop(deviceId ?? device?.id);
     }
@@ -578,39 +534,6 @@ class BmcAudioDecoder {
     );
   }
 
-  /// iOS: start capture via native AVAudioEngine plugin.
-  Future<void> _startCaptureIOS({String? deviceId}) async {
-    try {
-      _debug('iOS: Starting native AVAudioEngine capture');
-
-      _setupEventChannelListener();
-
-      final captureResult = await _methodChannel.invokeMethod('startCapture', {
-        'sampleRate': _config.sampleRate,
-        'channels': _config.channels,
-      });
-
-      _state = BmcCaptureState.capturing;
-      _debug('✓ iOS capture started');
-
-      if (captureResult is Map) {
-        final hwRate = captureResult['hardwareSampleRate'] as double?;
-        final rateMatch = captureResult['rateMatch'] as bool? ?? false;
-        _debug('  hardwareSampleRate=$hwRate, rateMatch=$rateMatch');
-
-        if (!rateMatch) {
-          _debug('⚠️ iOS hardware rate ($hwRate) != requested (${_config.sampleRate})');
-          _debug('XOR decryption may produce noise due to resampling!');
-        }
-      }
-    } catch (e, stack) {
-      _debug('FAILED to start iOS capture: $e');
-      _debug('Stack: ${stack.toString().split('\n').take(3).join(' | ')}');
-      _state = BmcCaptureState.idle;
-      _outputController?.addError(e);
-      _outputController?.close();
-    }
-  }
 
   /// Desktop: start capture via flutter_recorder.
   Future<void> _startCaptureDesktop(String? deviceId) async {
