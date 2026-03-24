@@ -106,6 +106,10 @@ class BmcAudioDecoder {
 
   /// Offset search state (for non-Android platforms)
   bool _offsetFound = false;
+
+  /// Whether capture is via CCID tunnel (iOS). When true, offset search is
+  /// skipped because firmware resets sampleIndex=0 on startStream.
+  bool _ccidMode = false;
   final List<Uint8List> _offsetSearchBuffer = [];
   int _offsetSearchBytes = 0;
 
@@ -414,10 +418,9 @@ class BmcAudioDecoder {
     // Store resolved decrypt state for _processRawPcm
     _resolvedDecrypt = shouldDecrypt;
 
-    // Reset offset search state — always search on all platforms.
-    // Even on Android USB Direct, the firmware primes 2 packets before
-    // the app starts reading, so sampleIndex may not be 0.
+    // Reset offset search state.
     _offsetFound = false;
+    _ccidMode = false;
     _offsetSearchBuffer.clear();
     _offsetSearchBytes = 0;
 
@@ -485,22 +488,49 @@ class BmcAudioDecoder {
         }
       } else {
         // Standard capture (AudioRecord on Android, AVAudioEngine on iOS)
-        _debug('${_isAndroid ? "Android" : "iOS"}: Native capture mode');
 
-        final int? parsedDeviceId = deviceId != null
-            ? int.tryParse(deviceId)
-            : (device?.id != null ? int.tryParse(device!.id) : null);
+        // iOS + BMC device + decrypt ON → use CCID audio bridge
+        // CoreAudio's Float32 pipeline is lossy and breaks XOR decryption.
+        // The CCID bridge reads encrypted PCM16LE bit-exact via CryptoTokenKit.
+        final bool useIosCcid = !_isAndroid &&
+            _resolvedDecrypt == true &&
+            (device?.isBmc ?? false);
 
-        _setupEventChannelListener();
+        if (useIosCcid) {
+          _debug('iOS: CCID audio bridge mode (bit-exact encrypted PCM)');
+          _setupEventChannelListener();
 
-        await _methodChannel.invokeMethod('startCapture', {
-          'deviceId': parsedDeviceId,
-          'sampleRate': _config.sampleRate,
-          'channels': _config.channels,
-        });
+          // CCID mode: firmware resets sampleIndex=0 on startStream,
+          // so offset is always 0. Skip offset search (which fails
+          // during mic warmup silence).
+          _ccidMode = true;
+          _offsetFound = true;
+          _crypto!.reset();
+          _crypto!.sampleIndex = 0;
+          _debug('CCID mode: offset fixed at 0 (firmware crypto reset)');
 
-        _state = BmcCaptureState.capturing;
-        _debug('✓ Native capture started');
+          final result = await _methodChannel.invokeMethod('startCcidCapture');
+
+          _state = BmcCaptureState.capturing;
+          _debug('✓ CCID capture started: $result');
+        } else {
+          _debug('${_isAndroid ? "Android" : "iOS"}: Native capture mode');
+
+          final int? parsedDeviceId = deviceId != null
+              ? int.tryParse(deviceId)
+              : (device?.id != null ? int.tryParse(device!.id) : null);
+
+          _setupEventChannelListener();
+
+          await _methodChannel.invokeMethod('startCapture', {
+            'deviceId': parsedDeviceId,
+            'sampleRate': _config.sampleRate,
+            'channels': _config.channels,
+          });
+
+          _state = BmcCaptureState.capturing;
+          _debug('✓ Native capture started');
+        }
       }
     } catch (e, stack) {
       _debug('FAILED to start native capture: $e');
@@ -624,6 +654,25 @@ class BmcAudioDecoder {
 
     try {
       if (_resolvedDecrypt && _crypto != null) {
+        if (_ccidMode) {
+          // ── CCID mode: self-synchronizing decrypt ──
+          // Each chunk = [4-byte sampleIdx LE] + [PCM16LE data]
+          // Parse the sampleIndex header and set crypto before decrypting.
+          if (rawPcm.length <= 4) {
+            return; // Header only, no PCM data
+          }
+          final sampleIdx = rawPcm[0] |
+              (rawPcm[1] << 8) |
+              (rawPcm[2] << 16) |
+              (rawPcm[3] << 24);
+          final pcmData = Uint8List.sublistView(rawPcm, 4);
+
+          _crypto!.sampleIndex = sampleIdx;
+          _crypto!.transformPcm16le(pcmData);
+          _outputController?.add(pcmData);
+          return;
+        }
+
         if (!_offsetFound) {
           // Buffer data for offset search
           _offsetSearchBuffer.add(Uint8List.fromList(rawPcm));
@@ -639,6 +688,34 @@ class BmcAudioDecoder {
             }
 
             _debug('Running offset search on $_offsetSearchBytes bytes...');
+
+            // ── Diagnostic: dump first bytes and check crypto alignment ──
+            if (combined.length >= 16) {
+              final hexDump = combined.sublist(0, 16)
+                  .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
+                  .join(' ');
+              _debug('First 16 bytes (encrypted): $hexDump');
+
+              // Compute expected keystream at offset 0
+              final testCrypto = BmcAudioCrypto(seed: _config.seed);
+              testCrypto.sampleIndex = 0;
+              final testBuf = Uint8List.fromList(combined.sublist(0, 16));
+              testCrypto.transformPcm16le(testBuf);
+              final decHex = testBuf
+                  .map((b) => b.toRadixString(16).padLeft(2, '0').toUpperCase())
+                  .join(' ');
+              _debug('After XOR offset=0: $decHex');
+
+              // Parse first 4 decrypted samples
+              final samples = <int>[];
+              for (int i = 0; i < 8 && i * 2 + 1 < testBuf.length; i++) {
+                int s = testBuf[i * 2] | (testBuf[i * 2 + 1] << 8);
+                if (s > 32767) s -= 65536;
+                samples.add(s);
+              }
+              _debug('Decrypted samples @offset=0: $samples');
+            }
+
             final (bestOffset, bestScore) = BmcAudioCrypto.searchOffset(
               combined,
               seed: _config.seed,
