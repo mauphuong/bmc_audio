@@ -4,7 +4,7 @@
 			"path": "."
 		},
 		{
-			"path": "../../../SUSB2026/FW/bmc_msc_ccid_hid_bm"
+			"path": "../../USB2026/FW/bmc_msc_ccid_hid_bm"
 		}
 	],
 	"settings": {}

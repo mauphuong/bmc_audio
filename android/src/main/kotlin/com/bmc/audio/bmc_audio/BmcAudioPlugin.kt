@@ -291,8 +291,12 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
         else PendingIntent.FLAG_UPDATE_CURRENT
 
+        // Explicit Intent required on Android 14+ (API 34) with FLAG_MUTABLE
+        val intent = Intent(ACTION_USB_PERMISSION).apply {
+            setPackage(context.packageName)
+        }
         usbManager.requestPermission(device,
-            PendingIntent.getBroadcast(context, 0, Intent(ACTION_USB_PERMISSION), flags))
+            PendingIntent.getBroadcast(context, 0, intent, flags))
     }
 
     private fun findUsbDevice(usbManager: UsbManager, vid: Int?, pid: Int?): UsbDevice? {

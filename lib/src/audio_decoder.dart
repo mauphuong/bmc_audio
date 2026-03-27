@@ -248,9 +248,25 @@ class BmcAudioDecoder {
         final productName = map['productName']?.toString() ?? 'USB Audio';
         final mfrName = map['manufacturerName']?.toString() ?? '';
 
-        // Check if already in AudioManager result
+        // If already in AudioManager, enrich existing entry with VID/PID
+        // so USB Direct capture path can be used (AudioRecord is unreliable
+        // for encrypted USB audio on some devices like Android 14 Samsung).
         if (hasUsbAudioInManager) {
-          _debug('  USB device "$productName" — already in AudioManager');
+          final existing = result.firstWhere((d) => d.isUsb, orElse: () => result.first);
+          if (existing.vendorId == null) {
+            final idx = result.indexOf(existing);
+            result[idx] = BmcAudioDevice(
+              id: existing.id,
+              name: existing.name,
+              isUsb: existing.isUsb,
+              isBmc: existing.isBmc || BmcAudioDevice.looksLikeBmc(productName),
+              vendorId: vid,
+              productId: pid,
+            );
+            _debug('  USB device "$productName" — enriched with VID=0x${vid.toRadixString(16)} PID=0x${pid.toRadixString(16)}');
+          } else {
+            _debug('  USB device "$productName" — already in AudioManager');
+          }
           continue;
         }
 
