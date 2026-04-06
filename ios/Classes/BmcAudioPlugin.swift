@@ -424,9 +424,25 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         audioEngine?.stop()
         audioEngine = nil
 
-        // Deactivate audio session
-        try? AVAudioSession.sharedInstance().setActive(false,
-            options: .notifyOthersOnDeactivation)
+        // CRITICAL: Reset audio session for playback.
+        // During capture we use .measurement mode which disables all signal
+        // processing. After stopping, we must reset to .playback/.default so
+        // that just_audio (and other audio players) can function properly.
+        // Without this, the session remains in a state where the audio player
+        // gets err=-12860 on subsequent playback attempts.
+        let session = AVAudioSession.sharedInstance()
+        do {
+            // First deactivate to release recording resources
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+            // Reset to playback-friendly configuration
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true)
+            NSLog("BmcAudioPlugin: Session reset to playback mode")
+        } catch {
+            NSLog("BmcAudioPlugin: Session reset error: \(error)")
+            // Fallback: just deactivate
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        }
 
         NSLog("BmcAudioPlugin: Capture stopped")
     }
@@ -551,8 +567,21 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
-        try? AVAudioSession.sharedInstance().setActive(false,
-            options: .notifyOthersOnDeactivation)
+
+        // CRITICAL: Reset audio session for playback after CCID capture.
+        // Same issue as stopCapture() — the session is left in .measurement
+        // mode with .playAndRecord category, which causes just_audio to fail
+        // with err=-12860 on subsequent playback attempts.
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setActive(false, options: .notifyOthersOnDeactivation)
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(true)
+            NSLog("BmcAudioPlugin: CCID session reset to playback mode")
+        } catch {
+            NSLog("BmcAudioPlugin: CCID session reset error: \(error)")
+            try? session.setActive(false, options: .notifyOthersOnDeactivation)
+        }
 
         NSLog("BmcAudioPlugin: CCID capture stopped")
     }

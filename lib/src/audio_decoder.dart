@@ -506,11 +506,19 @@ class BmcAudioDecoder {
         // Standard capture (AudioRecord on Android, AVAudioEngine on iOS)
 
         // iOS + BMC device + decrypt ON → use CCID audio bridge
-        // CoreAudio's Float32 pipeline is lossy and breaks XOR decryption.
+        // CoreAudio's Float32 pipeline resamples audio → breaks XOR decryption.
         // The CCID bridge reads encrypted PCM16LE bit-exact via CryptoTokenKit.
+        _debug('Capture path decision: isAndroid=$_isAndroid, '
+            'decrypt=$_resolvedDecrypt, '
+            'device.isBmc=${device?.isBmc}, '
+            'device.name="${device?.name}", '
+            'device.isUsb=${device?.isUsb}');
+
         final bool useIosCcid = !_isAndroid &&
             _resolvedDecrypt == true &&
             (device?.isBmc ?? false);
+
+        _debug('→ useIosCcid=$useIosCcid');
 
         if (useIosCcid) {
           _debug('iOS: CCID audio bridge mode (bit-exact encrypted PCM)');

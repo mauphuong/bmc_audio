@@ -70,6 +70,7 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
   String? _savedWavPath;
   bool _isPlaying = false;
   final AudioPlayer _audioPlayer = AudioPlayer();
+  StreamSubscription? _playerStateSubscription;
 
   // Stream
   StreamSubscription<Uint8List>? _audioSubscription;
@@ -83,6 +84,7 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
   @override
   void dispose() {
     _stopCapture();
+    _playerStateSubscription?.cancel();
     _audioPlayer.dispose();
     _decoder.dispose();
     super.dispose();
@@ -405,10 +407,19 @@ class _AudioCaptureScreenState extends State<AudioCaptureScreen> {
         _showSnackBar('Opened in system player');
       } else {
         // Android/iOS: use just_audio
+        // Stop any previous playback and release resources first
+        await _audioPlayer.stop();
+
+        // Cancel previous state listener to avoid stacking subscriptions
+        await _playerStateSubscription?.cancel();
+
+        // Small delay to let iOS audio session settle after capture stop
+        await Future.delayed(const Duration(milliseconds: 100));
+
         await _audioPlayer.setFilePath(_savedWavPath!);
         setState(() => _isPlaying = true);
 
-        _audioPlayer.playerStateStream.listen((state) {
+        _playerStateSubscription = _audioPlayer.playerStateStream.listen((state) {
           if (state.processingState == ProcessingState.completed) {
             setState(() => _isPlaying = false);
           }
