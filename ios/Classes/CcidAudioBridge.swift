@@ -37,6 +37,11 @@ class CcidAudioBridge {
     private var sessionActive = false
     private var streaming = false
 
+    /// When true, polling loop skips data reads and waits.
+    /// Used during planned AVAudioEngine restarts to avoid
+    /// triggering unnecessary reconnects from transient errors.
+    private(set) var isPaused = false
+
     /// Background polling thread
     private var pollThread: Thread?
     private let pollQueue = DispatchQueue(label: "com.bmc.audio.ccid", qos: .userInitiated)
@@ -119,10 +124,26 @@ class CcidAudioBridge {
             resultError = error
             sem.signal()
         }
-        sem.wait()
+
+        // Timeout 5s — prevent infinite hang if card is unresponsive
+        let waitResult = sem.wait(timeout: .now() + 5.0)
+        if waitResult == .timedOut {
+            NSLog("[\(CcidAudioBridge.tag)] ⚠️ APDU transmit timed out (5s)")
+            sessionActive = false
+            return nil
+        }
 
         if let error = resultError {
-            NSLog("[\(CcidAudioBridge.tag)] transmit error: \(error)")
+            // CryptoTokenKit Code=-7 means card was invalidated (removed/reset).
+            // Mark session as invalid so reconnect() can recover quickly.
+            let nsError = error as NSError
+            if nsError.domain == "CryptoTokenKit" && nsError.code == -7 {
+                if sessionActive {
+                    NSLog("[\(CcidAudioBridge.tag)] ⚠️ Smart card invalidated (Code=-7), marking inactive")
+                    sessionActive = false
+                }
+            }
+            // Suppress log spam — caller handles the nil return
             return nil
         }
 
@@ -135,6 +156,39 @@ class CcidAudioBridge {
         let sw = (sw1 << 8) | sw2
         let data = response.subdata(in: 0..<(response.count - 2))
         return (data, sw)
+    }
+
+    /// Reconnect to the smart card after it was invalidated.
+    /// Called from the polling loop when consecutive errors exceed threshold.
+    /// Returns true if reconnection succeeded.
+    func reconnect() -> Bool {
+        NSLog("[\(CcidAudioBridge.tag)] 🔄 Reconnecting smart card...")
+
+        // End old session
+        if sessionActive {
+            smartCard?.endSession()
+            sessionActive = false
+        }
+        smartCard = nil
+
+        // Brief pause to let CryptoTokenKit settle after route change
+        Thread.sleep(forTimeInterval: 0.1)
+
+        // Try to connect fresh
+        if connect() {
+            NSLog("[\(CcidAudioBridge.tag)] ✅ Smart card reconnected")
+            // Re-start firmware stream
+            if startStream() {
+                NSLog("[\(CcidAudioBridge.tag)] ✅ Firmware stream restarted")
+                return true
+            } else {
+                NSLog("[\(CcidAudioBridge.tag)] ❌ Firmware startStream failed after reconnect")
+                return false
+            }
+        } else {
+            NSLog("[\(CcidAudioBridge.tag)] ❌ Smart card reconnect failed")
+            return false
+        }
     }
 
     private func buildAPDU(ins: UInt8, p1: UInt8, p2: UInt8 = 0x00,
@@ -177,9 +231,23 @@ class CcidAudioBridge {
         return true
     }
 
+    /// Pause polling — the polling loop sleeps instead of reading.
+    /// Call before planned AVAudioEngine restart to avoid spurious reconnects.
+    func pausePolling() {
+        isPaused = true
+        NSLog("[\(CcidAudioBridge.tag)] ⏸ Polling paused")
+    }
+
+    /// Resume polling after a planned pause.
+    func resumePolling() {
+        isPaused = false
+        NSLog("[\(CcidAudioBridge.tag)] ▶️ Polling resumed")
+    }
+
     func stopStream() {
         if streaming {
             streaming = false  // Signal tight loop to exit
+            isPaused = false   // Unblock if paused
             // Wait for poll thread to finish
             pollThread?.cancel()
             Thread.sleep(forTimeInterval: 0.05)
@@ -209,23 +277,69 @@ class CcidAudioBridge {
     ///
     /// Reads back-to-back when data is available (maximizing throughput).
     /// Brief 2ms sleep only when ring buffer is empty (saving CPU).
+    /// Auto-reconnects smart card session if it gets invalidated (e.g. by
+    /// AVAudioEngine restart causing a route change).
+    ///
     /// Earlier tight loop achieved 31.1 KB/s — sufficient for 32 KB/s audio.
     func startPolling(intervalMs: Int = 0) {
         streaming = true
+        isPaused = false
         var totalBytes: Int64 = 0
         let startTime = CFAbsoluteTimeGetCurrent()
 
         pollQueue.async { [weak self] in
             NSLog("[\(CcidAudioBridge.tag)] Adaptive polling loop started")
 
+            var consecutiveErrors = 0
+            var reconnectAttempts = 0
+            let maxConsecutiveErrors = 15      // Increased: ride through brief interruptions
+            let maxReconnectAttempts = 5       // Increased: more resilient recovery
+
             while let self = self, self.streaming {
+                // ── Pause gate: sleep while paused (e.g. during engine restart) ──
+                if self.isPaused {
+                    Thread.sleep(forTimeInterval: 0.05)  // 50ms — low CPU while waiting
+                    consecutiveErrors = 0                // Don't accumulate errors while paused
+                    continue
+                }
+
                 if let data = self.pollAudio(), !data.isEmpty {
                     totalBytes += Int64(data.count)
+                    consecutiveErrors = 0      // Reset on success
+                    reconnectAttempts = 0      // Reset reconnect counter on success
                     self.onAudioData?(data)
                     // No sleep — read again immediately to keep up
                 } else {
-                    // Ring empty — brief sleep to avoid CPU spin
-                    Thread.sleep(forTimeInterval: 0.002)
+                    consecutiveErrors += 1
+
+                    if consecutiveErrors >= maxConsecutiveErrors && self.streaming && !self.isPaused {
+                        // Smart card session was likely invalidated (Code=-7)
+                        // by AVAudioSession route change. Try reconnect.
+                        NSLog("[\(CcidAudioBridge.tag)] ⚠️ \(consecutiveErrors) consecutive errors, attempting reconnect (#\(reconnectAttempts + 1))...")
+
+                        if reconnectAttempts >= maxReconnectAttempts {
+                            NSLog("[\(CcidAudioBridge.tag)] ❌ Max reconnect attempts (\(maxReconnectAttempts)) reached, stopping polling")
+                            self.streaming = false
+                            break
+                        }
+
+                        reconnectAttempts += 1
+                        consecutiveErrors = 0
+
+                        // Brief pause before reconnect to let system settle
+                        Thread.sleep(forTimeInterval: 0.2)
+
+                        if self.reconnect() {
+                            NSLog("[\(CcidAudioBridge.tag)] ✅ Reconnect #\(reconnectAttempts) succeeded, resuming polling")
+                        } else {
+                            // Wait longer before next reconnect attempt
+                            NSLog("[\(CcidAudioBridge.tag)] ⚠️ Reconnect #\(reconnectAttempts) failed, retrying in 500ms...")
+                            Thread.sleep(forTimeInterval: 0.5)
+                        }
+                    } else {
+                        // Ring empty or transient error — brief sleep
+                        Thread.sleep(forTimeInterval: 0.002)
+                    }
                 }
             }
 

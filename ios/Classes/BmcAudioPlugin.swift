@@ -23,6 +23,12 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private var audioEngine: AVAudioEngine?
     private var isCapturing = false
 
+    /// Tracks whether we are in CCID (USB) capture mode.
+    /// When true, restartAudioEngineIfNeeded() uses .default mode (no VPIO)
+    /// to avoid render err: -1 conflicts with USB audio route.
+    /// When false, .voiceChat mode is used for built-in mic echo cancellation.
+    private var isCcidMode = false
+
     /// The actual sample rate the hardware is delivering.
     private var actualSampleRate: Double = 16000
 
@@ -55,6 +61,24 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             name: AVAudioSession.routeChangeNotification,
             object: nil
         )
+
+        // Observe AVAudioSession interruptions to auto-restart AVAudioEngine
+        // when another audio source (e.g. ringtone AudioPlayer) changes session.
+        NotificationCenter.default.addObserver(
+            instance,
+            selector: #selector(handleInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+
+        // Observe AVAudioEngine configuration changes (e.g. sample rate change)
+        // to restart engine with new format.
+        NotificationCenter.default.addObserver(
+            instance,
+            selector: #selector(handleEngineConfigChange(_:)),
+            name: .AVAudioEngineConfigurationChange,
+            object: nil
+        )
     }
 
     /// Handle audio route changes (USB device plug/unplug)
@@ -77,6 +101,126 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             self?.methodChannel?.invokeMethod("onRouteChange", arguments: [
                 "reason": reasonStr
             ])
+        }
+    }
+
+    /// Handle AVAudioSession interruption.
+    /// If another audio component (e.g. CallRing's AudioPlayer) changes the
+    /// session category/mode, it may stop our AVAudioEngine. We must restart
+    /// the engine to keep the UAC endpoint streaming so CCID reads work.
+    @objc private func handleInterruption(_ notification: Notification) {
+        guard let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+            return
+        }
+
+        switch type {
+        case .began:
+            NSLog("BmcAudioPlugin: ⚠️ AVAudioSession interruption BEGAN (isCapturing=\(isCapturing))")
+        case .ended:
+            NSLog("BmcAudioPlugin: ✓ AVAudioSession interruption ENDED")
+            if isCapturing {
+                restartAudioEngineIfNeeded()
+            }
+        @unknown default:
+            NSLog("BmcAudioPlugin: Unknown interruption type=\(typeValue)")
+        }
+    }
+
+    /// Handle AVAudioEngine configuration change (e.g. sample rate change from
+    /// another audio session taking over).
+    @objc private func handleEngineConfigChange(_ notification: Notification) {
+        NSLog("BmcAudioPlugin: ⚠️ AVAudioEngine configuration changed (isCapturing=\(isCapturing))")
+        if isCapturing {
+            // Delay slightly to let the system settle
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.restartAudioEngineIfNeeded()
+            }
+        }
+    }
+
+    /// Restart AVAudioEngine if it was stopped (e.g. by session interruption).
+    /// This keeps the UAC endpoint alive so CCID can continue reading audio.
+    private func restartAudioEngineIfNeeded() {
+        guard isCapturing else { return }
+
+        // If engine is already running, nothing to do
+        if let engine = audioEngine, engine.isRunning {
+            NSLog("BmcAudioPlugin: AVAudioEngine already running, skip restart")
+            return
+        }
+
+        NSLog("BmcAudioPlugin: 🔄 Restarting AVAudioEngine (UAC keepalive)...")
+
+        // ✅ Pause CCID polling BEFORE engine restart to prevent
+        // spurious reconnect attempts during the route change
+        if isCcidMode {
+            ccidBridge.pausePolling()
+        }
+
+        do {
+            let session = AVAudioSession.sharedInstance()
+            // Re-apply our session config (another player may have changed it)
+            // Use .default mode for CCID/USB (no VPIO - avoids render err: -1 with USB route)
+            // Use .voiceChat for non-USB (needs VPIO for built-in mic echo cancellation)
+            let sessionMode: AVAudioSession.Mode = isCcidMode ? .default : .voiceChat
+            NSLog("BmcAudioPlugin: 🔄 Restart with mode=\(sessionMode.rawValue) (isCcidMode=\(isCcidMode))")
+            try session.setCategory(.playAndRecord, mode: sessionMode,
+                                     options: [.allowBluetooth])
+            try session.setPreferredSampleRate(16000)
+            try session.setActive(true)
+
+            // Select USB input again
+            if let inputs = session.availableInputs {
+                for input in inputs where input.portType == .usbAudio {
+                    try session.setPreferredInput(input)
+                    NSLog("BmcAudioPlugin: 🔄 Re-selected USB input: \(input.portName)")
+                    break
+                }
+            }
+
+            // Stop old engine if it exists
+            if let oldEngine = audioEngine {
+                oldEngine.inputNode.removeTap(onBus: 0)
+                oldEngine.stop()
+            }
+
+            // Create fresh engine
+            let engine = AVAudioEngine()
+            let inputNode = engine.inputNode
+            let fmt = inputNode.outputFormat(forBus: 0)
+
+            // ✅ FIX: Validate format BEFORE installTap
+            // When USB is unplugged during route change, format may have 0 Hz sampleRate
+            // installTap with 0 Hz format throws uncatchable ObjC exception:
+            // 'IsFormatSampleRateAndChannelCountValid(format)' → app crash
+            if fmt.sampleRate < 1.0 || fmt.channelCount == 0 {
+                NSLog("BmcAudioPlugin: ⚠️ Invalid format for restart (rate=\(fmt.sampleRate), ch=\(fmt.channelCount)). Stopping capture to prevent crash.")
+                isCapturing = false
+                audioEngine = nil
+                return
+            }
+
+            inputNode.installTap(onBus: 0, bufferSize: 1600, format: fmt) { _, _ in
+                // Discard — only keeping UAC endpoint alive
+            }
+
+            try engine.start()
+            audioEngine = engine
+
+            let route = session.currentRoute
+            let inputNames = route.inputs.map { "\($0.portName)(\($0.portType.rawValue))" }
+            NSLog("BmcAudioPlugin: ✅ AVAudioEngine restarted (format=\(fmt), inputs=\(inputNames))")
+        } catch {
+            NSLog("BmcAudioPlugin: ❌ Failed to restart AVAudioEngine: \(error)")
+        }
+
+        // ✅ Resume CCID polling AFTER engine is stable
+        // Brief delay to let route settle before CCID resumes reading
+        if isCcidMode {
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.ccidBridge.resumePolling()
+            }
         }
     }
 
@@ -138,6 +282,9 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         let session = AVAudioSession.sharedInstance()
         var devices: [[String: Any]] = []
 
+        // Remember if we were already capturing — if so, don't touch the session afterwards.
+        let wasCaptureActive = isCapturing
+
         // Activate session so iOS exposes USB audio ports in availableInputs.
         // Without this, only built-in mic shows up even when USB device is connected.
         do {
@@ -150,6 +297,8 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
         // List available input ports
         guard let availableInputs = session.availableInputs else {
+            // ✅ Reset session even on early return
+            if !wasCaptureActive { _resetSessionAfterListing() }
             return devices
         }
 
@@ -175,7 +324,42 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             NSLog("BmcAudioPlugin: Device [\(index)] \"\(name)\" type=\(port.portType.rawValue) usb=\(isUsb) bmc=\(isBmc)")
         }
 
+        // ✅ CRITICAL: Release microphone after listing if not actively capturing.
+        // Without this, the yellow mic indicator stays on from app launch.
+        if !wasCaptureActive {
+            _resetSessionAfterListing()
+        }
+
         return devices
+    }
+
+    /// Called after device listing to release microphone.
+    /// Resets session to .playback so the mic indicator goes away.
+    /// UsbConnectorPlugin handles USB detection independently via routeChangeNotification
+    /// so deactivating here does NOT affect USB plug/unplug detection.
+    private func _resetSessionAfterListing() {
+        let session = AVAudioSession.sharedInstance()
+
+        // Nếu đang ở .playAndRecord rồi (từ capture hoặc call), không cần reset
+        if session.category == .playAndRecord && isCapturing {
+            NSLog("BmcAudioPlugin: Skip reset — capture is active")
+            return
+        }
+
+        do {
+            try session.setCategory(.playback, mode: .default, options: [
+                .allowBluetoothA2DP,
+                .allowAirPlay
+            ])
+            NSLog("BmcAudioPlugin: Session reset to .playback after device listing (mic released)")
+        } catch {
+            // Error -50 xảy ra khi USB device có endpoint type "Other" (như S-USB AIO)
+            // iOS không thể switch sang .playback vì Endpoint Value Converter fail
+            // ✅ FIX: KHÔNG deactivate session! setActive(false) sẽ xoá USB port
+            // khỏi currentRoute → UsbConnectorPlugin fire DETACHED → app huỷ cuộc gọi!
+            // Chấp nhận session ở state hiện tại — sẽ được configure đúng khi capture bắt đầu.
+            NSLog("BmcAudioPlugin: Accept current session state (USB prevents .playback, skip deactivate to avoid fake DETACH)")
+        }
     }
 
     /// Heuristic to detect BMC devices by name.
@@ -199,14 +383,14 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
         do {
             // 1. Configure AVAudioSession
+            // ✅ FIX: Use .default mode instead of .measurement
+            // .measurement mode invalidates FlutterSoundPlayer's audio engine
+            // (which runs in the same process) → player gets killed → no audio output
+            // .default mode + setVoiceProcessingEnabled(false) achieves the same
+            // "no signal processing" goal without disrupting other audio engines
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .allowBluetooth])
-
-            // CRITICAL: Use .measurement mode to disable ALL signal processing
-            // (echo cancellation, AGC, noise reduction). Without this, CoreAudio
-            // modifies the XOR-encrypted audio stream before we can decrypt it,
-            // resulting in noise output.
-            try session.setMode(.measurement)
+            try session.setMode(.default)
 
             // Request the firmware's sample rate — iOS will use it if the USB device supports it
             try session.setPreferredSampleRate(Double(sampleRate))
@@ -248,12 +432,17 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                 }
             }
 
+            // ✅ FIX: Wait for iOS to settle the audio route after session reconfiguration
+            // Without this, inputNode may return 0 Hz format → crash
+            Thread.sleep(forTimeInterval: 0.05)
+
             // 3. Create audio engine
             let engine = AVAudioEngine()
             let inputNode = engine.inputNode
 
             // Disable voice processing (iOS 15+) to prevent modification
-            // of encrypted audio stream
+            // of encrypted audio stream. This achieves the same as .measurement mode
+            // but without disrupting other audio engines in the process.
             if #available(iOS 15.0, *) {
                 do {
                     try inputNode.setVoiceProcessingEnabled(false)
@@ -270,17 +459,45 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
             NSLog("BmcAudioPlugin: Hardware format: rate=\(hwFormat.sampleRate), channels=\(hwChannels), bits=\(hwFormat.commonFormat.rawValue)")
 
-            // 5. We tap in the NATIVE Float32 format to avoid CoreAudio's
-            //    format converter which adds dithering noise during Float32→Int16
-            //    conversion. Even 1-bit dither completely breaks XOR decryption.
-            let tapFormat = inputNode.outputFormat(forBus: 0)
+            // 5. Determine tap format — validate before use to prevent crash
+            // ✅ FIX: After session reconfiguration, inputNode may return 0 Hz format
+            // (especially with USB devices that have "Other" endpoint type).
+            // If format is invalid, construct a valid format manually.
+            var tapFormat = inputNode.outputFormat(forBus: 0)
 
             NSLog("BmcAudioPlugin: Tap format: rate=\(tapFormat.sampleRate), channels=\(tapFormat.channelCount), commonFormat=\(tapFormat.commonFormat.rawValue)")
 
+            // ✅ FIX: Validate format — sampleRate and channelCount MUST be > 0
+            // Otherwise installTap will throw uncatchable ObjC exception:
+            // 'IsFormatSampleRateAndChannelCountValid(format)' → app crash
+            if tapFormat.sampleRate < 1.0 || tapFormat.channelCount == 0 {
+                NSLog("BmcAudioPlugin: ⚠️ Invalid tap format (rate=\(tapFormat.sampleRate), ch=\(tapFormat.channelCount)). Constructing fallback format...")
+
+                // Use session's actual sample rate, or our requested rate as fallback
+                let fallbackRate = session.sampleRate > 0 ? session.sampleRate : Double(sampleRate)
+                let fallbackChannels: UInt32 = max(1, hwChannels > 0 ? hwChannels : 1)
+
+                guard let validFormat = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: fallbackRate,
+                    channels: AVAudioChannelCount(fallbackChannels),
+                    interleaved: false
+                ) else {
+                    NSLog("BmcAudioPlugin: ❌ Cannot construct valid format, aborting capture")
+                    result(FlutterError(code: "FORMAT_ERROR",
+                                        message: "Cannot create valid audio format (rate=\(fallbackRate), ch=\(fallbackChannels))",
+                                        details: nil))
+                    return
+                }
+
+                tapFormat = validFormat
+                actualSampleRate = fallbackRate
+                NSLog("BmcAudioPlugin: Using fallback format: rate=\(fallbackRate), channels=\(fallbackChannels)")
+            }
+
             // 6. If hardware rate != requested rate, log warning
-            if abs(hwFormat.sampleRate - Double(sampleRate)) > 1.0 {
-                NSLog("BmcAudioPlugin: ⚠️ Hardware rate (\(hwFormat.sampleRate)) != requested (\(sampleRate)). XOR decrypt may not work!")
-                actualSampleRate = hwFormat.sampleRate
+            if abs(actualSampleRate - Double(sampleRate)) > 1.0 {
+                NSLog("BmcAudioPlugin: ⚠️ Actual rate (\(actualSampleRate)) != requested (\(sampleRate)). XOR decrypt may not work!")
             }
 
             // 7. Install tap on input node — capture in native Float32
@@ -405,7 +622,7 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                 "sampleRate": actualSampleRate,
                 "hardwareSampleRate": hwFormat.sampleRate,
                 "channels": channels,
-                "rateMatch": abs(hwFormat.sampleRate - Double(sampleRate)) < 1.0,
+                "rateMatch": abs(actualSampleRate - Double(sampleRate)) < 1.0,
             ])
 
         } catch {
@@ -435,7 +652,10 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             // First deactivate to release recording resources
             try session.setActive(false, options: .notifyOthersOnDeactivation)
             // Reset to playback-friendly configuration
-            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setCategory(.playback, mode: .default, options: [
+                .allowBluetoothA2DP,
+                .allowAirPlay
+            ])
             try session.setActive(true)
             NSLog("BmcAudioPlugin: Session reset to playback mode")
         } catch {
@@ -466,18 +686,24 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             return
         }
 
+        NSLog("BmcAudioPlugin: CCID: Starting capture...")
+
         // Connect to smart card (always reconnect fresh to handle device removal)
         ccidBridge.disconnect()
+        NSLog("BmcAudioPlugin: CCID: Connecting to smart card...")
         guard ccidBridge.connect() else {
-            NSLog("BmcAudioPlugin: CCID connect failed")
+            NSLog("BmcAudioPlugin: CCID connect failed — no smart card slot found")
             result(FlutterError(code: "CCID_CONNECT_FAILED",
                                 message: "Could not connect to smart card", details: nil))
             return
         }
+        NSLog("BmcAudioPlugin: CCID: ✓ Smart card connected")
 
         // Check status before starting
         if let status = ccidBridge.getStatus() {
             NSLog("BmcAudioPlugin: CCID status before start: avail=\(status.avail) rate=\(status.sampleRate) enc=\(status.encrypted) streaming=\(status.streaming)")
+        } else {
+            NSLog("BmcAudioPlugin: CCID: ⚠️ getStatus returned nil")
         }
 
         // ── CRITICAL: Activate AVAudioEngine to keep UAC endpoint alive ──
@@ -487,19 +713,35 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         // triggering the firmware to generate packets → fill ring buffer → CCID reads it.
         // The AVAudioEngine data itself is DISCARDED (lossy Float32); we only use the
         // bit-exact CCID data.
+        //
+        // NOTE: We use .default mode (NOT .voiceChat or .measurement) because:
+        //   - .voiceChat auto-creates VPIO audio unit → conflicts with USB audio route
+        //     → render err: -1 continuously on lock screen when FlutterSoundPlayer runs
+        //   - .measurement disables all signal processing including output routing,
+        //     which kills FlutterSoundPlayer (err=-12860) running simultaneously.
+        //   - .default keeps playAndRecord category active without creating VPIO
+        //   - We do NOT use .defaultToSpeaker because USB calls route output
+        //     to earpiece, and .defaultToSpeaker would override that.
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playAndRecord, mode: .measurement,
-                                     options: [.allowBluetooth, .defaultToSpeaker])
+            NSLog("BmcAudioPlugin: CCID: Current session: cat=\(session.category.rawValue) mode=\(session.mode.rawValue)")
+            try session.setCategory(.playAndRecord, mode: .default,
+                                     options: [.allowBluetooth])
             try session.setPreferredSampleRate(16000)
             try session.setActive(true)
+            NSLog("BmcAudioPlugin: CCID: Session configured (.playAndRecord, .default)")
 
             // Select S-USB AIO input
             if let inputs = session.availableInputs {
+                var foundUsb = false
                 for input in inputs where input.portType == .usbAudio {
                     try session.setPreferredInput(input)
                     NSLog("BmcAudioPlugin: CCID: Selected USB input: \(input.portName)")
+                    foundUsb = true
                     break
+                }
+                if !foundUsb {
+                    NSLog("BmcAudioPlugin: CCID: ⚠️ No USB audio input found in \(inputs.count) inputs")
                 }
             }
 
@@ -515,19 +757,29 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
             try engine.start()
             audioEngine = engine
-            NSLog("BmcAudioPlugin: CCID: AVAudioEngine started (UAC keepalive, format=\(fmt))")
+            NSLog("BmcAudioPlugin: CCID: ✓ AVAudioEngine started (UAC keepalive, format=\(fmt))")
+
+            // Verify route after engine start
+            let route = session.currentRoute
+            let inputNames = route.inputs.map { "\($0.portName)(\($0.portType.rawValue))" }
+            let outputNames = route.outputs.map { "\($0.portName)(\($0.portType.rawValue))" }
+            NSLog("BmcAudioPlugin: CCID: Route after engine: inputs=\(inputNames) outputs=\(outputNames)")
         } catch {
             NSLog("BmcAudioPlugin: CCID: ⚠️ AVAudioEngine failed: \(error) — ring buffer may be empty")
         }
 
         // Start encrypted audio stream on firmware
+        NSLog("BmcAudioPlugin: CCID: Starting firmware stream...")
         guard ccidBridge.startStream() else {
+            NSLog("BmcAudioPlugin: CCID: ❌ startStream failed")
             result(FlutterError(code: "CCID_START_FAILED",
                                 message: "Could not start CCID audio stream", details: nil))
             return
         }
+        NSLog("BmcAudioPlugin: CCID: ✓ Firmware stream started")
 
         isCapturing = true
+        isCcidMode = true
 
         // Set up polling — receive encrypted PCM chunks and forward to Dart
         var chunkCount: Int64 = 0
@@ -546,10 +798,10 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             }
         }
 
-        // Poll every 20ms (~50 Hz) — balances latency vs CPU usage
+        // Start adaptive polling (tight loop with 2ms sleep when idle)
         ccidBridge.startPolling(intervalMs: 20)
 
-        NSLog("BmcAudioPlugin: ✓ CCID capture started (encrypted, bit-exact)")
+        NSLog("BmcAudioPlugin: ✓ CCID capture started (encrypted, bit-exact, .default mode)")
 
         result([
             "sampleRate": 16000,
@@ -560,26 +812,34 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
     /// Stop CCID audio capture.
     private func stopCcidCapture() {
+        NSLog("BmcAudioPlugin: CCID: Stopping capture...")
         ccidBridge.stopStream()
+        ccidBridge.disconnect()
         ccidBridge.onAudioData = nil
 
         // Stop AVAudioEngine UAC keepalive
         audioEngine?.inputNode.removeTap(onBus: 0)
         audioEngine?.stop()
         audioEngine = nil
+        isCapturing = false
+        isCcidMode = false
+        NSLog("BmcAudioPlugin: CCID: AVAudioEngine stopped")
 
-        // CRITICAL: Reset audio session for playback after CCID capture.
-        // Same issue as stopCapture() — the session is left in .measurement
-        // mode with .playAndRecord category, which causes just_audio to fail
-        // with err=-12860 on subsequent playback attempts.
+        // CRITICAL: Deactivate the audio session and reset to playback mode.
+        // This releases the microphone (removes yellow dot indicator on iOS).
+        // Previously we kept .playAndRecord/.voiceChat "for FlutterSoundPlayer",
+        // but that left the mic indicator active indefinitely after the call.
         let session = AVAudioSession.sharedInstance()
         do {
+            // Deactivate first to release recording/input resources
             try session.setActive(false, options: .notifyOthersOnDeactivation)
+            // Reset to playback-only mode (no microphone access)
             try session.setCategory(.playback, mode: .default, options: [])
             try session.setActive(true)
-            NSLog("BmcAudioPlugin: CCID session reset to playback mode")
+            NSLog("BmcAudioPlugin: CCID: Session reset to .playback (mic released)")
         } catch {
-            NSLog("BmcAudioPlugin: CCID session reset error: \(error)")
+            NSLog("BmcAudioPlugin: CCID: Session reset error: \(error)")
+            // Fallback: at least try to deactivate
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
         }
 
