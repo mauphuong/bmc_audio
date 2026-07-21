@@ -137,8 +137,22 @@ class BmcAudioDecoder {
     }
   }
 
-  /// Whether we're running on a platform with native plugin (Android or iOS).
-  bool get _hasNativePlugin => _isAndroid || _isIOS;
+  /// Whether we're running on Linux desktop.
+  bool get _isLinux {
+    try {
+      return !kIsWeb && Platform.isLinux;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Whether we're running on a platform with a native plugin.
+  ///
+  /// Android/iOS use platform channels for bit-exact capture. Linux also uses
+  /// the native plugin (libusb isochronous) so USB audio bytes are delivered
+  /// bit-exact — mandatory for XOR decryption. Windows/macOS still fall back to
+  /// `flutter_recorder`.
+  bool get _hasNativePlugin => _isAndroid || _isIOS || _isLinux;
 
   /// Create a decoder with default or custom configuration.
   BmcAudioDecoder({BmcAudioConfig? config})
@@ -229,9 +243,11 @@ class BmcAudioDecoder {
         }
       }
 
-      // 2. UsbManager devices (Android only — for composite USB devices)
-      // Add USB audio-class devices NOT already in AudioManager
-      if (!_isAndroid) return result;
+      // 2. USB hardware devices (Android + Linux — for composite USB devices).
+      // Add USB audio-class devices NOT already in the OS device list, and
+      // enrich existing entries with VID/PID so the USB-direct capture path
+      // (isochronous) can be used.
+      if (!_isAndroid && !_isLinux) return result;
 
       final bool hasUsbAudioInManager = result.any((d) => d.isUsb);
 
@@ -457,8 +473,8 @@ class BmcAudioDecoder {
     BmcAudioDevice? device,
   }) async {
     try {
-      // Determine if this is a USB-direct device (Android composite, not in AudioManager)
-      final bool isUsbDirect = _isAndroid &&
+      // Determine if this is a USB-direct device (Android/Linux composite).
+      final bool isUsbDirect = (_isAndroid || _isLinux) &&
           device?.vendorId != null && device?.productId != null;
 
       if (isUsbDirect) {
@@ -745,15 +761,18 @@ class BmcAudioDecoder {
               seed: _config.seed,
               maxOffset: _config.sampleRate, // search up to 1 second
             );
-            _debug('Offset search: best=$bestOffset, score=${bestScore.toStringAsFixed(4)}');
+            _debug('Offset search: best=$bestOffset, corr=${bestScore.toStringAsFixed(4)}');
 
+            // Lock once. searchOffset uses a silence-robust metric
+            // (meanAdjacentDiff), so the packet-aligned offset is correct even
+            // if capture starts during silence; the keystream then stays
+            // aligned as sampleIndex advances and real audio arrives.
             _offsetFound = true;
             _crypto!.reset();
             _crypto!.sampleIndex = bestOffset;
-
-            // Process all buffered data with correct offset
             _crypto!.transformPcm16le(combined);
             _outputController?.add(combined);
+            _debug('✓ Offset LOCKED at $bestOffset');
             _offsetSearchBuffer.clear();
             _offsetSearchBytes = 0;
           }

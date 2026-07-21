@@ -1,0 +1,220 @@
+// bmc_audio_cli — standalone Linux capture + decrypt tool for the BMC S-USB.
+//
+// Exercises the exact same pipeline as the Flutter Linux plugin, with no
+// Flutter/Dart toolchain required:
+//   1. libusb isochronous capture from the audio-streaming IN endpoint
+//      (bypasses ALSA/PulseAudio/PipeWire → bit-exact bytes).
+//   2. XOR keystream decryption — a faithful C port of lib/src/audio_crypto.dart
+//      (mix32 / keystream16), matching firmware source/uac/audio_crypto.c.
+//   3. Keystream offset search (port of BmcAudioCrypto.searchOffset).
+//   4. Writes <base>_enc.wav (raw encrypted) and <base>_dec.wav (decrypted).
+//
+// Build:  gcc bmc_audio_cli.c -o bmc_audio_cli $(pkg-config --cflags --libs libusb-1.0) -lm
+// Run:    ./bmc_audio_cli [-d seconds] [-o basename] [-s seedHex]
+//
+// USB access needs no root if the user is in the 'plugdev' group (uaccess ACL).
+
+#include <libusb-1.0/libusb.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define VID 0x1fc9  // NXP / BMC
+#define USB_CLASS_AUDIO 1
+#define USB_SUBCLASS_AS 2
+#define ISO_NPKT 32
+#define ISO_NXFER 8
+
+// ── Crypto (port of lib/src/audio_crypto.dart) ───────────────────────────
+static uint32_t g_seed = 0xC0FFEE12u;
+
+static uint32_t mix32(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x7FEB352Du;
+  x ^= x >> 15;
+  x *= 0x846CA68Bu;
+  x ^= x >> 16;
+  return x;
+}
+static uint16_t keystream16(uint32_t sample_index) {
+  return (uint16_t)mix32(g_seed ^ sample_index);
+}
+// XOR transform in place, starting from keystream index `start`.
+static void transform(uint8_t *pcm, size_t nbytes, uint32_t start) {
+  size_t samples = nbytes / 2;
+  for (size_t i = 0; i < samples; i++) {
+    uint16_t k = keystream16(start + (uint32_t)i);
+    pcm[i * 2] ^= k & 0xFF;
+    pcm[i * 2 + 1] ^= (k >> 8) & 0xFF;
+  }
+}
+// Adjacent-sample correlation (port of scoreAudioLike): 0=noise .. 1=clean.
+static double score_audio(const uint8_t *pcm, size_t nbytes) {
+  size_t n = nbytes / 2;
+  if (n < 64) return 0.0;
+  const int16_t *s = (const int16_t *)pcm;
+  double mean = 0;
+  for (size_t i = 0; i < n; i++) mean += s[i];
+  mean /= n;
+  double sab = 0, saa = 0, sbb = 0;
+  for (size_t i = 0; i + 1 < n; i++) {
+    double a = s[i] - mean, b = s[i + 1] - mean;
+    sab += a * b; saa += a * a; sbb += b * b;
+  }
+  double d = saa * sbb;
+  return d < 1e-12 ? 0.0 : fabs(sab / sqrt(d));
+}
+// Coarse+fine search for the best keystream offset (port of searchOffset).
+static uint32_t search_offset(const uint8_t *pcm, size_t nbytes,
+                              uint32_t max_off, double *best_score) {
+  size_t win = nbytes / 2 > 8192 ? 8192 * 2 : nbytes;
+  uint8_t *tmp = malloc(win);
+  uint32_t best = 0; double bs = -1;
+  for (uint32_t off = 0; off <= max_off; off += 16) {
+    memcpy(tmp, pcm, win); transform(tmp, win, off);
+    double sc = score_audio(tmp, win);
+    if (sc > bs) { bs = sc; best = off; }
+  }
+  uint32_t lo = best > 64 ? best - 64 : 0, hi = best + 64;
+  for (uint32_t off = lo; off <= hi && off <= max_off; off++) {
+    memcpy(tmp, pcm, win); transform(tmp, win, off);
+    double sc = score_audio(tmp, win);
+    if (sc > bs) { bs = sc; best = off; }
+  }
+  free(tmp);
+  *best_score = bs;
+  return best;
+}
+
+// ── WAV writer (PCM16LE mono 16 kHz) ─────────────────────────────────────
+static void write_wav(const char *path, const uint8_t *pcm, size_t n) {
+  FILE *f = fopen(path, "wb");
+  if (!f) { perror("fopen"); return; }
+  uint32_t rate = 16000, byte_rate = 16000 * 2, ds = (uint32_t)n, sz = 16;
+  uint16_t ch = 1, ba = 2, bits = 16, fmt = 1;
+  fwrite("RIFF", 1, 4, f); uint32_t r = 36 + ds; fwrite(&r, 4, 1, f);
+  fwrite("WAVEfmt ", 1, 8, f); fwrite(&sz, 4, 1, f);
+  fwrite(&fmt, 2, 1, f); fwrite(&ch, 2, 1, f); fwrite(&rate, 4, 1, f);
+  fwrite(&byte_rate, 4, 1, f); fwrite(&ba, 2, 1, f); fwrite(&bits, 2, 1, f);
+  fwrite("data", 1, 4, f); fwrite(&ds, 4, 1, f);
+  fwrite(pcm, 1, n, f);
+  fclose(f);
+}
+
+// ── Capture state ────────────────────────────────────────────────────────
+static uint8_t *g_buf; static size_t g_cap, g_len; static volatile int g_run = 1;
+
+static void LIBUSB_CALL cb(struct libusb_transfer *x) {
+  if (!g_run) return;
+  for (int i = 0; i < x->num_iso_packets; i++) {
+    struct libusb_iso_packet_descriptor *d = &x->iso_packet_desc[i];
+    if (d->status == LIBUSB_TRANSFER_COMPLETED && d->actual_length > 0) {
+      unsigned char *p = libusb_get_iso_packet_buffer_simple(x, i);
+      if (g_len + d->actual_length <= g_cap) {
+        memcpy(g_buf + g_len, p, d->actual_length);
+        g_len += d->actual_length;
+      }
+    }
+  }
+  if (g_run) libusb_submit_transfer(x);
+}
+
+// Scan for the audio-streaming (class=1/subclass=2) iso IN endpoint.
+static int find_ep(libusb_device *dev, int *intf, int *alt, int *ep, int *mpk) {
+  struct libusb_config_descriptor *cfg;
+  if (libusb_get_active_config_descriptor(dev, &cfg)) return 0;
+  int ok = 0;
+  for (int i = 0; i < cfg->bNumInterfaces && !ok; i++)
+    for (int a = 0; a < cfg->interface[i].num_altsetting && !ok; a++) {
+      const struct libusb_interface_descriptor *id =
+          &cfg->interface[i].altsetting[a];
+      if (id->bInterfaceClass != USB_CLASS_AUDIO ||
+          id->bInterfaceSubClass != USB_SUBCLASS_AS) continue;
+      for (int e = 0; e < id->bNumEndpoints; e++) {
+        const struct libusb_endpoint_descriptor *epd = &id->endpoint[e];
+        if ((epd->bmAttributes & 3) == LIBUSB_TRANSFER_TYPE_ISOCHRONOUS &&
+            (epd->bEndpointAddress & LIBUSB_ENDPOINT_IN)) {
+          *intf = id->bInterfaceNumber; *alt = id->bAlternateSetting;
+          *ep = epd->bEndpointAddress; *mpk = epd->wMaxPacketSize; ok = 1; break;
+        }
+      }
+    }
+  libusb_free_config_descriptor(cfg);
+  return ok;
+}
+
+int main(int argc, char **argv) {
+  double secs = 5.0; const char *base = "bmc_capture";
+  for (int i = 1; i < argc - 1; i++) {
+    if (!strcmp(argv[i], "-d")) secs = atof(argv[++i]);
+    else if (!strcmp(argv[i], "-o")) base = argv[++i];
+    else if (!strcmp(argv[i], "-s")) g_seed = (uint32_t)strtoul(argv[++i], 0, 16);
+  }
+  printf("BMC S-USB capture: %.1fs, seed=0x%08X\n", secs, g_seed);
+
+  libusb_context *ctx; libusb_init(&ctx);
+  libusb_device_handle *h = libusb_open_device_with_vid_pid(ctx, VID, 0x0117);
+  if (!h) {  // fall back to first audio-class 1fc9 device
+    libusb_device **devs; ssize_t n = libusb_get_device_list(ctx, &devs);
+    for (ssize_t i = 0; i < n && !h; i++) {
+      struct libusb_device_descriptor dd;
+      if (!libusb_get_device_descriptor(devs[i], &dd) && dd.idVendor == VID) {
+        int a, b, c, d2; if (find_ep(devs[i], &a, &b, &c, &d2)) libusb_open(devs[i], &h);
+      }
+    }
+    libusb_free_device_list(devs, 1);
+  }
+  if (!h) { fprintf(stderr, "Device not found (or no permission)\n"); return 1; }
+
+  int intf, alt, ep, mpk;
+  if (!find_ep(libusb_get_device(h), &intf, &alt, &ep, &mpk)) {
+    fprintf(stderr, "No audio-streaming iso IN endpoint\n"); return 2;
+  }
+  printf("Endpoint: intf=%d alt=%d EP=0x%02X maxpkt=%d\n", intf, alt, ep, mpk);
+
+  libusb_set_auto_detach_kernel_driver(h, 1);
+  int r = libusb_claim_interface(h, intf);
+  if (r < 0) { fprintf(stderr, "claim: %s\n", libusb_strerror(r)); return 3; }
+  libusb_set_interface_alt_setting(h, intf, alt);
+
+  g_cap = (size_t)(secs * 32000) + 65536; g_buf = malloc(g_cap); g_len = 0;
+  struct libusb_transfer *xf[ISO_NXFER];
+  for (int i = 0; i < ISO_NXFER; i++) {
+    xf[i] = libusb_alloc_transfer(ISO_NPKT);
+    uint8_t *b = malloc(mpk * ISO_NPKT);
+    libusb_fill_iso_transfer(xf[i], h, ep, b, mpk * ISO_NPKT, ISO_NPKT, cb, 0, 1000);
+    libusb_set_iso_packet_lengths(xf[i], mpk);
+    libusb_submit_transfer(xf[i]);
+  }
+  struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+  printf("Capturing...\n");
+  while (g_run) {
+    struct timeval tv = {0, 100000}; libusb_handle_events_timeout(ctx, &tv);
+    struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
+    if ((t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9 >= secs) g_run = 0;
+  }
+  libusb_set_interface_alt_setting(h, intf, 0);
+  libusb_release_interface(h, intf);
+  libusb_close(h); libusb_exit(ctx);
+
+  printf("Captured %zu bytes (~%.2fs)\n", g_len, g_len / 32000.0);
+  double raw = score_audio(g_buf, g_len);
+  double best; uint32_t off = search_offset(g_buf, g_len, 16000, &best);
+  uint8_t *dec = malloc(g_len); memcpy(dec, g_buf, g_len);
+  transform(dec, g_len, off);
+  double decs = score_audio(dec, g_len);
+  printf("Score RAW (encrypted): %.4f\n", raw);
+  printf("Offset found: %u  (search score %.4f)\n", off, best);
+  printf("Score DECRYPTED:       %.4f  %s\n", decs,
+         decs > 0.3 ? "-> clean audio :)" : "-> check seed/device");
+
+  char p[512];
+  snprintf(p, sizeof p, "%s_enc.wav", base); write_wav(p, g_buf, g_len);
+  printf("Wrote %s\n", p);
+  snprintf(p, sizeof p, "%s_dec.wav", base); write_wav(p, dec, g_len);
+  printf("Wrote %s\n", p);
+  return 0;
+}

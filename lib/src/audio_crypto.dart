@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 /// BMC Audio Crypto — Pure Dart port of firmware `audio_crypto.c`.
@@ -204,74 +205,91 @@ class BmcAudioCrypto {
     final denom = (sumAA * sumBB);
     if (denom < 1e-12) return 0.0;
 
-    // import 'dart:math' is not needed: sqrt can be approximated
-    // but we need it for precision
-    final corr = sumAB / _sqrt(denom);
+    final corr = sumAB / math.sqrt(denom);
     return corr.abs();
   }
 
-  /// Simple sqrt without importing dart:math.
-  static double _sqrt(double x) {
-    if (x <= 0) return 0;
-    double r = x;
-    for (int i = 0; i < 20; i++) {
-      r = (r + x / r) / 2;
+  /// Mean absolute difference between adjacent 16-bit samples.
+  ///
+  /// This is the metric used to align the keystream, because it works for
+  /// **both** real audio and digital silence:
+  /// - Correctly-decrypted audio is smooth → small adjacent difference.
+  /// - Correctly-decrypted silence is all zeros → adjacent difference ~0.
+  /// - A wrong keystream offset yields pseudo-random noise → huge difference.
+  ///
+  /// (Adjacent-sample correlation via [scoreAudioLike] cannot distinguish the
+  /// true offset during silence, where every offset scores ~0.)
+  static double meanAdjacentDiff(Uint8List pcm16le) {
+    final sampleCount = pcm16le.length ~/ 2;
+    if (sampleCount < 2) return 0.0;
+    int prev = pcm16le[0] | (pcm16le[1] << 8);
+    if (prev > 32767) prev -= 65536;
+    double sum = 0;
+    for (int i = 1; i < sampleCount; i++) {
+      int s = pcm16le[i * 2] | (pcm16le[i * 2 + 1] << 8);
+      if (s > 32767) s -= 65536;
+      sum += (s - prev).abs();
+      prev = s;
     }
-    return r;
+    return sum / (sampleCount - 1);
   }
 
   /// Search for the best keystream offset.
   ///
-  /// When capturing via OS audio driver (Windows WASAPI, etc.), the firmware
-  /// has been streaming for an unknown number of samples before our app starts.
-  /// This finds the correct `sampleIndex` to start decryption.
+  /// When capturing via USB-direct (Android/Linux) or the OS audio driver
+  /// (Windows/macOS), the firmware may have streamed some samples before our
+  /// app starts reading. This finds the correct starting `sampleIndex`.
+  ///
+  /// Selection minimizes [meanAdjacentDiff] (robust to silence). The USB audio
+  /// packet is 16 samples, so the true offset is a multiple of 16 — the coarse
+  /// step of 16 lands on it exactly; the fine pass covers any residual jitter.
   ///
   /// [cipherPcm16le] — first chunk of captured (encrypted) audio bytes.
   /// [maxOffset] — maximum offset to search (default: 16000 = 1 second at 16kHz).
   ///
-  /// Returns `(bestOffset, bestScore)`.
+  /// Returns `(bestOffset, confidence)` where confidence is the
+  /// adjacent-sample correlation ([scoreAudioLike]) at the chosen offset
+  /// (informational: high for audio, ~0 for silence — both still valid locks).
   static (int, double) searchOffset(
     Uint8List cipherPcm16le, {
     int seed = defaultSeed,
     int maxOffset = 16000,
   }) {
     final sampleCount = cipherPcm16le.length ~/ 2;
-    // Use a reasonable window size
     final window = sampleCount > 8192 ? 8192 : sampleCount;
     final windowBytes = window * 2;
     final segment = cipherPcm16le.sublist(0, windowBytes);
 
     int bestOffset = 0;
-    double bestScore = -1.0;
+    double bestDiff = double.infinity;
 
     final crypto = BmcAudioCrypto(seed: seed);
 
-    // Coarse search: step 16 samples
-    for (int off = 0; off <= maxOffset; off += 16) {
+    void evaluate(int off) {
       crypto._sampleIndex = off;
       final test = Uint8List.fromList(segment);
       crypto.transformPcm16le(test);
-      final score = scoreAudioLike(test);
-      if (score > bestScore) {
-        bestScore = score;
+      final diff = meanAdjacentDiff(test);
+      if (diff < bestDiff) {
+        bestDiff = diff;
         bestOffset = off;
       }
     }
 
-    // Fine search: +/- 64 around best
+    // Coarse search on the packet grid (16 samples), then refine.
+    for (int off = 0; off <= maxOffset; off += 16) {
+      evaluate(off);
+    }
     final fineStart = (bestOffset - 64).clamp(0, maxOffset);
     final fineEnd = (bestOffset + 64).clamp(0, maxOffset);
     for (int off = fineStart; off <= fineEnd; off++) {
-      crypto._sampleIndex = off;
-      final test = Uint8List.fromList(segment);
-      crypto.transformPcm16le(test);
-      final score = scoreAudioLike(test);
-      if (score > bestScore) {
-        bestScore = score;
-        bestOffset = off;
-      }
+      evaluate(off);
     }
 
-    return (bestOffset, bestScore);
+    // Report correlation at the chosen offset for logging.
+    crypto._sampleIndex = bestOffset;
+    final chosen = Uint8List.fromList(segment);
+    crypto.transformPcm16le(chosen);
+    return (bestOffset, scoreAudioLike(chosen));
   }
 }
