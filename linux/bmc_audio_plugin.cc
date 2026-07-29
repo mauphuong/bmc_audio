@@ -70,17 +70,36 @@ struct AudioChunk {
   BmcAudioPlugin* self;
   uint8_t* data;
   size_t len;
+  // Isochronous packets in this transfer that reported an error. Those carried
+  // audio the device had already folded into its encryption keystream, so the
+  // Dart side has to re-acquire its keystream position rather than assume the
+  // bytes it did receive are contiguous.
+  int dropped;
 };
 
 static gboolean send_chunk_idle(gpointer user_data) {
   AudioChunk* chunk = static_cast<AudioChunk*>(user_data);
   BmcAudioPlugin* self = chunk->self;
   if (self->listening && self->event_channel != nullptr) {
-    g_autoptr(FlValue) value = fl_value_new_uint8_list(chunk->data, chunk->len);
-    fl_event_channel_send(self->event_channel, value, nullptr, nullptr);
+    g_autoptr(FlValue) map = fl_value_new_map();
+    fl_value_set_string_take(map, "pcm",
+                             fl_value_new_uint8_list(chunk->data, chunk->len));
+    fl_value_set_string_take(map, "dropped", fl_value_new_int(chunk->dropped));
+    fl_event_channel_send(self->event_channel, map, nullptr, nullptr);
   }
   free(chunk->data);
   delete chunk;
+  return G_SOURCE_REMOVE;
+}
+
+// Tell the Dart side the device vanished mid-capture.
+static gboolean send_disconnect_idle(gpointer user_data) {
+  BmcAudioPlugin* self = static_cast<BmcAudioPlugin*>(user_data);
+  if (self->listening && self->event_channel != nullptr) {
+    fl_event_channel_send_error(
+        self->event_channel, "USB_DISCONNECTED",
+        "Audio device disconnected during capture", nullptr, nullptr, nullptr);
+  }
   return G_SOURCE_REMOVE;
 }
 
@@ -240,13 +259,24 @@ static void LIBUSB_CALL iso_transfer_cb(libusb_transfer* transfer) {
   if (!self->capturing.load()) return;
 
   // Assemble the completed packets into one contiguous chunk.
+  //
+  // A packet that completes with zero bytes is not a loss: the audio endpoint
+  // is asynchronous, so the device legitimately returns nothing in a frame it
+  // had no data ready for, and its keystream does not advance either. Only a
+  // packet that failed means bytes went missing from an otherwise contiguous
+  // sample stream.
   size_t total = 0;
+  int dropped = 0;
   for (int i = 0; i < transfer->num_iso_packets; i++) {
     libusb_iso_packet_descriptor* d = &transfer->iso_packet_desc[i];
-    if (d->status == LIBUSB_TRANSFER_COMPLETED) total += d->actual_length;
+    if (d->status == LIBUSB_TRANSFER_COMPLETED) {
+      total += d->actual_length;
+    } else {
+      dropped++;
+    }
   }
-  if (total > 0) {
-    uint8_t* buf = static_cast<uint8_t*>(malloc(total));
+  if (total > 0 || dropped > 0) {
+    uint8_t* buf = static_cast<uint8_t*>(malloc(total > 0 ? total : 1));
     size_t pos = 0;
     for (int i = 0; i < transfer->num_iso_packets; i++) {
       libusb_iso_packet_descriptor* d = &transfer->iso_packet_desc[i];
@@ -256,13 +286,23 @@ static void LIBUSB_CALL iso_transfer_cb(libusb_transfer* transfer) {
         pos += d->actual_length;
       }
     }
-    AudioChunk* chunk = new AudioChunk{self, buf, total};
+    AudioChunk* chunk = new AudioChunk{self, buf, total, dropped};
     g_idle_add(send_chunk_idle, chunk);
   }
 
   // Resubmit to keep streaming.
-  if (self->capturing.load()) {
-    libusb_submit_transfer(transfer);
+  //
+  // A transfer that comes back NO_DEVICE, or a resubmit that fails, means the
+  // device is gone -- unplugged, re-enumerated, or reset. Nothing downstream
+  // can recover from that on its own: the file descriptor is dead, so the
+  // stream would simply stop with the listener none the wiser. Report it so
+  // the app can tear the capture down and start again.
+  if (!self->capturing.load()) return;
+
+  if (transfer->status == LIBUSB_TRANSFER_NO_DEVICE ||
+      libusb_submit_transfer(transfer) != LIBUSB_SUCCESS) {
+    self->capturing.store(false);
+    g_idle_add(send_disconnect_idle, self);
   }
 }
 

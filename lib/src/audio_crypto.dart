@@ -234,15 +234,107 @@ class BmcAudioCrypto {
     return sum / (sampleCount - 1);
   }
 
+  /// Number of samples used by the first-pass probe in [searchOffset].
+  ///
+  /// The scoring surface is effectively a delta function: at any offset other
+  /// than the exact one, every sample decrypts to a different pseudo-random
+  /// value, so [meanAdjacentDiff] jumps to the ~21800 expected of uniform
+  /// noise. A short probe therefore separates the true offset from every other
+  /// candidate just as decisively as a long one, at a fraction of the cost.
+  static const int _probeSamples = 96;
+
+  /// How many probe candidates get re-scored against a long window.
+  static const int _probeCandidates = 8;
+
+  /// Samples used to confirm a candidate found by the probe pass.
+  static const int _verifySamples = 2048;
+
+  /// Score a single candidate offset over [windowSamples] samples.
+  static double _scoreOffset(
+    Uint8List cipher,
+    int seed,
+    int offset,
+    int windowSamples,
+  ) {
+    final available = cipher.length ~/ 2;
+    final n = windowSamples > available ? available : windowSamples;
+    if (n < 2) return double.infinity;
+
+    final crypto = BmcAudioCrypto(seed: seed);
+    crypto._sampleIndex = offset;
+    final test = Uint8List.sublistView(cipher, 0, n * 2);
+    final work = Uint8List.fromList(test);
+    crypto.transformPcm16le(work);
+    return meanAdjacentDiff(work);
+  }
+
+  /// Scan every offset in `[start, end]` and return the best candidates.
+  ///
+  /// Returns offsets sorted by ascending [meanAdjacentDiff], best first.
+  static List<int> _scanRange(
+    Uint8List cipher,
+    int seed,
+    int start,
+    int end,
+    int keep,
+  ) {
+    final scored = <({int offset, double diff})>[];
+
+    for (int off = start; off <= end; off++) {
+      final diff = _scoreOffset(cipher, seed, off, _probeSamples);
+      scored.add((offset: off, diff: diff));
+    }
+
+    scored.sort((a, b) => a.diff.compareTo(b.diff));
+    return scored.take(keep).map((e) => e.offset).toList();
+  }
+
+  /// Pick the candidate with the lowest long-window score.
+  static (int, double) _verifyCandidates(
+    Uint8List cipher,
+    int seed,
+    List<int> candidates,
+  ) {
+    int bestOffset = candidates.isEmpty ? 0 : candidates.first;
+    double bestDiff = double.infinity;
+
+    for (final off in candidates) {
+      final diff = _scoreOffset(cipher, seed, off, _verifySamples);
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestOffset = off;
+      }
+    }
+
+    // Report correlation at the chosen offset for logging.
+    final available = cipher.length ~/ 2;
+    final n = _verifySamples > available ? available : _verifySamples;
+    final crypto = BmcAudioCrypto(seed: seed);
+    crypto._sampleIndex = bestOffset;
+    final chosen = Uint8List.fromList(Uint8List.sublistView(cipher, 0, n * 2));
+    crypto.transformPcm16le(chosen);
+    return (bestOffset, scoreAudioLike(chosen));
+  }
+
   /// Search for the best keystream offset.
   ///
   /// When capturing via USB-direct (Android/Linux) or the OS audio driver
   /// (Windows/macOS), the firmware may have streamed some samples before our
   /// app starts reading. This finds the correct starting `sampleIndex`.
   ///
-  /// Selection minimizes [meanAdjacentDiff] (robust to silence). The USB audio
-  /// packet is 16 samples, so the true offset is a multiple of 16 — the coarse
-  /// step of 16 lands on it exactly; the fine pass covers any residual jitter.
+  /// Selection minimizes [meanAdjacentDiff], which is robust to silence:
+  /// correctly-decrypted silence is all zeros (difference ~0) whereas a wrong
+  /// offset yields pseudo-random noise (difference ~21800). Adjacent-sample
+  /// correlation cannot make that distinction during silence.
+  ///
+  /// This used to do a coarse pass stepping 16 samples at a time, on the
+  /// assumption that every USB packet carries exactly 16 samples so the true
+  /// offset must be a multiple of 16. That assumption no longer holds: the
+  /// firmware's audio endpoint is asynchronous and varies the payload between
+  /// 15 and 17 samples to track the host clock, so the cumulative offset can
+  /// be any integer. Since the scoring surface has no gradient to follow, a
+  /// grid that misses the true offset finds nothing at all — hence the
+  /// exhaustive probe pass below.
   ///
   /// [cipherPcm16le] — first chunk of captured (encrypted) audio bytes.
   /// [maxOffset] — maximum offset to search (default: 16000 = 1 second at 16kHz).
@@ -255,41 +347,29 @@ class BmcAudioCrypto {
     int seed = defaultSeed,
     int maxOffset = 16000,
   }) {
-    final sampleCount = cipherPcm16le.length ~/ 2;
-    final window = sampleCount > 8192 ? 8192 : sampleCount;
-    final windowBytes = window * 2;
-    final segment = cipherPcm16le.sublist(0, windowBytes);
+    final candidates =
+        _scanRange(cipherPcm16le, seed, 0, maxOffset, _probeCandidates);
+    return _verifyCandidates(cipherPcm16le, seed, candidates);
+  }
 
-    int bestOffset = 0;
-    double bestDiff = double.infinity;
-
-    final crypto = BmcAudioCrypto(seed: seed);
-
-    void evaluate(int off) {
-      crypto._sampleIndex = off;
-      final test = Uint8List.fromList(segment);
-      crypto.transformPcm16le(test);
-      final diff = meanAdjacentDiff(test);
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        bestOffset = off;
-      }
-    }
-
-    // Coarse search on the packet grid (16 samples), then refine.
-    for (int off = 0; off <= maxOffset; off += 16) {
-      evaluate(off);
-    }
-    final fineStart = (bestOffset - 64).clamp(0, maxOffset);
-    final fineEnd = (bestOffset + 64).clamp(0, maxOffset);
-    for (int off = fineStart; off <= fineEnd; off++) {
-      evaluate(off);
-    }
-
-    // Report correlation at the chosen offset for logging.
-    crypto._sampleIndex = bestOffset;
-    final chosen = Uint8List.fromList(segment);
-    crypto.transformPcm16le(chosen);
-    return (bestOffset, scoreAudioLike(chosen));
+  /// Re-acquire the keystream offset in a narrow window around [center].
+  ///
+  /// Used to recover from a mid-stream desynchronisation. A dropped
+  /// isochronous packet shifts the alignment by only a handful of samples, so
+  /// searching +/- [radius] around the expected index converges in a fraction
+  /// of the time a full search would take.
+  ///
+  /// Returns `(bestOffset, confidence)`.
+  static (int, double) searchOffsetNear(
+    Uint8List cipherPcm16le, {
+    required int center,
+    int seed = defaultSeed,
+    int radius = 512,
+  }) {
+    final start = (center - radius) < 0 ? 0 : (center - radius);
+    final end = center + radius;
+    final candidates =
+        _scanRange(cipherPcm16le, seed, start, end, _probeCandidates);
+    return _verifyCandidates(cipherPcm16le, seed, candidates);
   }
 }

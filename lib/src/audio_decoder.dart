@@ -116,6 +116,78 @@ class BmcAudioDecoder {
   /// Minimum bytes to collect before running offset search (~1s at 16kHz mono 16-bit)
   static const int _offsetSearchMinBytes = 32000;
 
+  // ── Keystream desync detection and recovery ──────────────────────────
+  //
+  // Isochronous transfers are not retransmitted. A single lost packet shifts
+  // the host's keystream position relative to the firmware's, and because the
+  // keystream is a function of a free-running sample counter every subsequent
+  // sample then decrypts to noise -- permanently. The original implementation
+  // locked the offset once and never revisited it, so one lost packet ended
+  // the useful part of the recording.
+  //
+  // Recovery works in two ways: the native layer reports packets it knows were
+  // dropped (immediate, certain), and the decrypted output is scored
+  // continuously (catches every other cause, including losses the host
+  // controller never reports).
+
+  /// Rolling mean adjacent-sample difference of the decrypted output.
+  double _healthDiff = 0.0;
+
+  /// Whether [_healthDiff] has been seeded.
+  bool _healthSeeded = false;
+
+  /// Weight of each new chunk in the [_healthDiff] EMA.
+  static const double _healthAlpha = 0.25;
+
+  /// Above this mean adjacent difference the output is considered desynced.
+  ///
+  /// Uniformly random 16-bit samples average about 21800; correctly decrypted
+  /// speech stays well under 6000 even when loud. The gap is wide enough that
+  /// a fixed threshold discriminates reliably.
+  static const double _desyncDiffThreshold = 12000.0;
+
+  /// True while collecting fresh cipher data to re-acquire the offset.
+  bool _resyncing = false;
+  final List<Uint8List> _resyncBuffer = [];
+  int _resyncBytes = 0;
+
+  /// Keystream index the firmware is believed to be at when resync began.
+  int _resyncExpectedIndex = 0;
+
+  /// Bytes of cipher to collect before attempting re-acquisition (~256 ms).
+  static const int _resyncMinBytes = 8192;
+
+  /// How far either side of the expected index a narrow re-acquisition looks.
+  ///
+  /// Sized for the common case: a handful of lost isochronous packets shifts
+  /// the alignment by tens of samples.
+  static const int _resyncRadius = 512;
+
+  /// Consecutive re-acquisition windows that failed to produce a clean lock.
+  int _resyncAttempts = 0;
+
+  /// After this many failures the stream is reported as unrecoverable.
+  ///
+  /// Re-acquisition still keeps running afterwards, but the listener is told
+  /// once so it can decide to tear the capture down and start again — which is
+  /// the only thing that helps if the device itself went away.
+  static const int _maxResyncAttempts = 4;
+
+  /// Whether the desync error has already been reported to the listener.
+  bool _desyncReported = false;
+
+  /// Number of times the keystream has been re-acquired this session.
+  int _resyncCount = 0;
+
+  /// Number of times the keystream has been re-acquired since capture started.
+  int get resyncCount => _resyncCount;
+
+  /// Packets the native layer reported as lost since capture started.
+  int _droppedPackets = 0;
+
+  /// Packets the native layer reported as lost since capture started.
+  int get droppedPackets => _droppedPackets;
+
   /// Optional debug callback — called with status messages.
   void Function(String message)? onDebug;
 
@@ -456,6 +528,16 @@ class BmcAudioDecoder {
     _offsetSearchBuffer.clear();
     _offsetSearchBytes = 0;
 
+    // Reset desync detection / recovery state.
+    _resyncing = false;
+    _resyncBuffer.clear();
+    _resyncBytes = 0;
+    _resyncCount = 0;
+    _resyncAttempts = 0;
+    _desyncReported = false;
+    _droppedPackets = 0;
+    _resetHealth();
+
     if (_hasNativePlugin) {
       _startCaptureNative(deviceId: deviceId, device: device);
     } else {
@@ -585,8 +667,26 @@ class BmcAudioDecoder {
   void _setupEventChannelListener() {
     int chunkCount = 0;
     _audioSubscription = _eventChannel.receiveBroadcastStream().listen(
-      (data) {
-        if (data is Uint8List) {
+      (event) {
+        // Two payload shapes are accepted. Platforms that can account for lost
+        // isochronous packets send {'pcm': Uint8List, 'dropped': int}; the
+        // others (and older native builds) send the bytes directly.
+        Uint8List? data;
+        int dropped = 0;
+
+        if (event is Uint8List) {
+          data = event;
+        } else if (event is Map) {
+          final pcm = event['pcm'];
+          if (pcm is Uint8List) data = pcm;
+          final d = event['dropped'];
+          if (d is int) dropped = d;
+        }
+
+        if (dropped > 0) {
+          _onPacketsDropped(dropped);
+        }
+        if (data != null) {
           chunkCount++;
           if (chunkCount <= 3 || chunkCount % 100 == 0) {
             _debug('Audio chunk #$chunkCount: ${data.length} bytes');
@@ -775,16 +875,185 @@ class BmcAudioDecoder {
             _debug('✓ Offset LOCKED at $bestOffset');
             _offsetSearchBuffer.clear();
             _offsetSearchBytes = 0;
+            _resetHealth();
           }
           return;
         }
 
+        if (_resyncing) {
+          _collectForResync(rawPcm);
+          return;
+        }
+
         _crypto!.transformPcm16le(rawPcm);
+        _checkHealth(rawPcm);
       }
       _outputController?.add(rawPcm);
     } catch (e) {
       _debug('Error processing audio: $e');
     }
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // Keystream desync detection and recovery
+  // ════════════════════════════════════════════════════════════════════
+
+  /// Clear the health estimate after a (re-)lock.
+  void _resetHealth() {
+    _healthDiff = 0.0;
+    _healthSeeded = false;
+  }
+
+  /// Score a freshly decrypted chunk and start a resync if it looks like noise.
+  void _checkHealth(Uint8List plainPcm) {
+    if (plainPcm.length < 4) return;
+
+    final diff = BmcAudioCrypto.meanAdjacentDiff(plainPcm);
+
+    if (!_healthSeeded) {
+      _healthDiff = diff;
+      _healthSeeded = true;
+    } else {
+      _healthDiff = _healthDiff * (1 - _healthAlpha) + diff * _healthAlpha;
+    }
+
+    if (_healthDiff > _desyncDiffThreshold) {
+      _debug('Keystream desync detected '
+          '(adjacent diff ${_healthDiff.toStringAsFixed(0)}) — re-acquiring');
+      _beginResync();
+    }
+  }
+
+  /// Called by the native layer when it knows isochronous packets were lost.
+  ///
+  /// A reported loss is certain evidence of desync, so this short-circuits the
+  /// score-based detector rather than waiting for the EMA to climb.
+  void _onPacketsDropped(int count) {
+    if (count <= 0) return;
+    _droppedPackets += count;
+
+    if (!_resolvedDecrypt || _ccidMode || !_offsetFound || _resyncing) {
+      return;
+    }
+
+    _debug('Native reported $count dropped packet(s) — re-acquiring keystream');
+    _beginResync();
+  }
+
+  /// Enter the resync state: buffer cipher instead of emitting it.
+  void _beginResync() {
+    if (_resyncing || _crypto == null) return;
+    _resyncing = true;
+    _resyncBuffer.clear();
+    _resyncBytes = 0;
+    _resyncExpectedIndex = _crypto!.sampleIndex;
+  }
+
+  /// Accumulate cipher until there is enough of it to re-acquire the offset.
+  void _collectForResync(Uint8List rawPcm) {
+    _resyncBuffer.add(Uint8List.fromList(rawPcm));
+    _resyncBytes += rawPcm.length;
+    if (_resyncBytes < _resyncMinBytes) return;
+
+    final combined = Uint8List(_resyncBytes);
+    int pos = 0;
+    for (final chunk in _resyncBuffer) {
+      combined.setAll(pos, chunk);
+      pos += chunk.length;
+    }
+    _resyncBuffer.clear();
+    _resyncBytes = 0;
+    final found = _tryReacquire(combined);
+
+    if (found == null) {
+      // Nothing in this window locked. Throw it away and try again on the next
+      // one rather than emitting noise, which is exactly what the caller is
+      // trying to get rid of.
+      _resyncAttempts++;
+      _debug('Re-acquisition failed (attempt $_resyncAttempts)');
+
+      if (_resyncAttempts >= _maxResyncAttempts && !_desyncReported) {
+        _desyncReported = true;
+        _debug('Keystream unrecoverable after $_resyncAttempts attempts');
+        _outputController?.addError(
+          StateError('bmc_audio: keystream could not be re-acquired after '
+              '$_resyncAttempts attempts. If the device was disconnected, '
+              'call stopCapture() then startCapture() to resynchronise.'),
+        );
+      }
+      return;
+    }
+
+    final (best, score) = found;
+
+    _resyncing = false;
+    _resyncAttempts = 0;
+    _desyncReported = false;
+    _resyncCount++;
+    _crypto!.sampleIndex = best + (combined.length ~/ 2);
+    _resetHealth();
+
+    _debug('✓ Keystream RE-ACQUIRED at $best '
+        '(was $_resyncExpectedIndex, drift ${best - _resyncExpectedIndex}, '
+        'corr ${score.toStringAsFixed(3)}, resync #$_resyncCount)');
+
+    _outputController?.add(
+      BmcAudioCrypto.transform(combined, seed: _config.seed, startIndex: best),
+    );
+  }
+
+  /// Try progressively wider strategies to find where the keystream really is.
+  ///
+  /// Returns `(offset, confidence)`, or null if none of them produced output
+  /// that looks like audio rather than noise.
+  (int, double)? _tryReacquire(Uint8List cipher) {
+    final expected = _resyncExpectedIndex;
+
+    // 1. A few lost packets: the alignment moved by tens of samples.
+    // 2. A longer stall (host scheduling gap, hub glitch): up to a second of
+    //    audio went missing.
+    //
+    // Both have to search *around the current index*. An absolute search would
+    // be looking in the wrong place entirely: after ten minutes of streaming
+    // the true index is in the millions, nowhere near 0..sampleRate.
+    for (final radius in [_resyncRadius, _config.sampleRate]) {
+      final (offset, score) = BmcAudioCrypto.searchOffsetNear(
+        cipher,
+        center: expected,
+        seed: _config.seed,
+        radius: radius,
+      );
+      if (_locksCleanly(cipher, offset)) {
+        _debug('Re-acquired within radius $radius');
+        return (offset, score);
+      }
+    }
+
+    // 3. The device re-primed its stream. Firmware calls AudioCrypto_Reset()
+    //    from UAC2_AppPrimeStream(), so after a re-enumeration or an
+    //    alt-setting bounce its keystream restarts near zero no matter how
+    //    long the previous session ran.
+    final (offset, score) = BmcAudioCrypto.searchOffset(
+      cipher,
+      seed: _config.seed,
+      maxOffset: _config.sampleRate,
+    );
+    if (_locksCleanly(cipher, offset)) {
+      _debug('Re-acquired near zero — the device restarted its stream');
+      return (offset, score);
+    }
+
+    return null;
+  }
+
+  /// Whether decrypting [cipher] from [offset] yields audio rather than noise.
+  bool _locksCleanly(Uint8List cipher, int offset) {
+    final probe = BmcAudioCrypto.transform(
+      cipher,
+      seed: _config.seed,
+      startIndex: offset,
+    );
+    return BmcAudioCrypto.meanAdjacentDiff(probe) <= _desyncDiffThreshold;
   }
 
   // ════════════════════════════════════════════════════════════════════

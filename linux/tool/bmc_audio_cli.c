@@ -67,25 +67,82 @@ static double score_audio(const uint8_t *pcm, size_t nbytes) {
   double d = saa * sbb;
   return d < 1e-12 ? 0.0 : fabs(sab / sqrt(d));
 }
-// Coarse+fine search for the best keystream offset (port of searchOffset).
+// Mean absolute difference between adjacent samples (port of
+// meanAdjacentDiff). Unlike score_audio this also works during silence:
+// correctly-decrypted silence is all zeros, while a wrong keystream offset
+// produces pseudo-random noise averaging about 21800.
+static double mean_adjacent_diff(const uint8_t *pcm, size_t nbytes) {
+  size_t n = nbytes / 2;
+  if (n < 2) return 0.0;
+  const int16_t *s = (const int16_t *)pcm;
+  double sum = 0;
+  for (size_t i = 1; i < n; i++) {
+    int d = (int)s[i] - (int)s[i - 1];
+    sum += d < 0 ? -d : d;
+  }
+  return sum / (double)(n - 1);
+}
+
+// Search for the best keystream offset (port of searchOffset).
+//
+// This used to step 16 samples at a time on the assumption that every USB
+// packet carries exactly 16 samples, so the offset had to be a multiple of 16.
+// The firmware's audio endpoint is now asynchronous and varies the payload
+// between 15 and 17 samples to track the host clock, so the offset can be any
+// integer. Scoring gives no gradient to follow -- only the exact offset scores
+// well -- so a grid that steps over the true value finds nothing at all.
+//
+// Instead every offset is probed with a short window (cheap, and just as
+// decisive because a wrong offset is indistinguishable from noise), then the
+// best few candidates are confirmed against a long window.
+#define PROBE_SAMPLES 96
+#define VERIFY_SAMPLES 2048
+#define PROBE_CANDIDATES 8
+
 static uint32_t search_offset(const uint8_t *pcm, size_t nbytes,
                               uint32_t max_off, double *best_score) {
-  size_t win = nbytes / 2 > 8192 ? 8192 * 2 : nbytes;
-  uint8_t *tmp = malloc(win);
-  uint32_t best = 0; double bs = -1;
-  for (uint32_t off = 0; off <= max_off; off += 16) {
-    memcpy(tmp, pcm, win); transform(tmp, win, off);
-    double sc = score_audio(tmp, win);
-    if (sc > bs) { bs = sc; best = off; }
+  size_t avail = nbytes / 2;
+  size_t probe_n = avail < PROBE_SAMPLES ? avail : PROBE_SAMPLES;
+  size_t verify_n = avail < VERIFY_SAMPLES ? avail : VERIFY_SAMPLES;
+  size_t probe_bytes = probe_n * 2, verify_bytes = verify_n * 2;
+
+  uint8_t *tmp = malloc(verify_bytes > probe_bytes ? verify_bytes : probe_bytes);
+  if (!tmp) { *best_score = 0; return 0; }
+
+  // Probe pass: keep the best PROBE_CANDIDATES offsets by adjacent difference.
+  uint32_t cand[PROBE_CANDIDATES];
+  double cand_diff[PROBE_CANDIDATES];
+  int ncand = 0;
+
+  for (uint32_t off = 0; off <= max_off; off++) {
+    memcpy(tmp, pcm, probe_bytes); transform(tmp, probe_bytes, off);
+    double d = mean_adjacent_diff(tmp, probe_bytes);
+
+    if (ncand < PROBE_CANDIDATES) {
+      cand[ncand] = off; cand_diff[ncand] = d; ncand++;
+    } else {
+      int worst = 0;
+      for (int i = 1; i < ncand; i++)
+        if (cand_diff[i] > cand_diff[worst]) worst = i;
+      if (d < cand_diff[worst]) { cand[worst] = off; cand_diff[worst] = d; }
+    }
   }
-  uint32_t lo = best > 64 ? best - 64 : 0, hi = best + 64;
-  for (uint32_t off = lo; off <= hi && off <= max_off; off++) {
-    memcpy(tmp, pcm, win); transform(tmp, win, off);
-    double sc = score_audio(tmp, win);
-    if (sc > bs) { bs = sc; best = off; }
+
+  // Verify pass: re-score the survivors over a much longer window.
+  uint32_t best = ncand > 0 ? cand[0] : 0;
+  double best_diff = 1e30;
+  for (int i = 0; i < ncand; i++) {
+    memcpy(tmp, pcm, verify_bytes); transform(tmp, verify_bytes, cand[i]);
+    double d = mean_adjacent_diff(tmp, verify_bytes);
+    if (d < best_diff) { best_diff = d; best = cand[i]; }
   }
+
+  // Report correlation at the chosen offset (informational only: high for
+  // speech, near zero for silence, both of which are valid locks).
+  memcpy(tmp, pcm, verify_bytes); transform(tmp, verify_bytes, best);
+  *best_score = score_audio(tmp, verify_bytes);
+
   free(tmp);
-  *best_score = bs;
   return best;
 }
 

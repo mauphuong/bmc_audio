@@ -81,12 +81,17 @@ Java_com_bmc_audio_bmc_1audio_BmcAudioPlugin_nativeSetInterface(
  * @param endpoint     Endpoint address (e.g. 0x81 for IN endpoint 1)
  * @param maxPacket    Max packet size per frame
  * @param numPackets   Number of isochronous packets per URB (e.g. 8..64)
+ * @param outDropped   Optional int[1]; receives the number of packets in this
+ *                     URB that failed. Those carried audio the device already
+ *                     folded into its encryption keystream, so the Dart side
+ *                     must re-acquire its keystream position instead of
+ *                     assuming the received bytes are contiguous.
  * @return byte array of received audio data, or null on error
  */
 JNIEXPORT jbyteArray JNICALL
 Java_com_bmc_audio_bmc_1audio_BmcAudioPlugin_nativeIsoRead(
     JNIEnv *env, jobject thiz, jint fd, jint endpoint, jint maxPacket,
-    jint numPackets) {
+    jint numPackets, jintArray outDropped) {
   if (numPackets <= 0 || numPackets > 128)
     numPackets = 8;
   if (maxPacket <= 0 || maxPacket > 4096)
@@ -143,18 +148,34 @@ Java_com_bmc_audio_bmc_1audio_BmcAudioPlugin_nativeIsoRead(
     return NULL;
   }
 
-  /* Collect audio data from completed packets */
+  /* Collect audio data from completed packets.
+   *
+   * A packet that completes with zero bytes is not a loss: the audio endpoint
+   * is asynchronous, so the device legitimately returns nothing in a frame it
+   * had no data ready for, and its keystream does not advance either. Only a
+   * packet that failed means bytes went missing from the sample stream.
+   */
   int totalData = 0;
+  int dropped = 0;
   for (int i = 0; i < numPackets; i++) {
     int actual = urb->iso_frame_desc[i].actual_length;
     int status = urb->iso_frame_desc[i].status;
-    if (status == 0 && actual > 0) {
+    if (status != 0) {
+      dropped++;
+      continue;
+    }
+    if (actual > 0) {
       /* Move data to beginning of collection buffer */
       if (totalData != (int)(maxPacket * i)) {
         memmove(buffer + totalData, buffer + maxPacket * i, actual);
       }
       totalData += actual;
     }
+  }
+
+  if (outDropped != NULL && (*env)->GetArrayLength(env, outDropped) > 0) {
+    jint d = (jint)dropped;
+    (*env)->SetIntArrayRegion(env, outDropped, 0, 1, &d);
   }
 
   jbyteArray result = NULL;

@@ -51,7 +51,19 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
     private external fun nativeClaimInterface(fd: Int, interfaceNum: Int): Int
     private external fun nativeReleaseInterface(fd: Int, interfaceNum: Int): Int
     private external fun nativeSetInterface(fd: Int, interfaceNum: Int, altSetting: Int): Int
-    private external fun nativeIsoRead(fd: Int, endpoint: Int, maxPacket: Int, numPackets: Int): ByteArray?
+    /**
+     * @param outDropped int[1] receiving the number of isochronous packets in
+     *   this URB that failed. Bytes lost that way break the contiguity the XOR
+     *   keystream depends on, so Dart re-acquires its position when it sees a
+     *   non-zero count.
+     */
+    private external fun nativeIsoRead(
+        fd: Int,
+        endpoint: Int,
+        maxPacket: Int,
+        numPackets: Int,
+        outDropped: IntArray?
+    ): ByteArray?
 
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
@@ -435,16 +447,28 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
                 var totalBytes = 0L
 
                 try {
+                    val droppedOut = IntArray(1)
+
                     while (isUsbCapturing) {
-                        val data = nativeIsoRead(fd, endpointAddr, maxPacketSize, numPackets)
+                        droppedOut[0] = 0
+                        val data = nativeIsoRead(fd, endpointAddr, maxPacketSize, numPackets, droppedOut)
+                        val dropped = droppedOut[0]
 
                         if (data != null && data.isNotEmpty()) {
                             chunkCount++
                             totalBytes += data.size
                             errorCount = 0
 
+                            val payload = mapOf<String, Any>(
+                                "pcm" to data,
+                                "dropped" to dropped
+                            )
                             mainHandler.post {
-                                eventSink?.success(data)
+                                eventSink?.success(payload)
+                            }
+
+                            if (dropped > 0) {
+                                Log.w(TAG, "ISO chunk #$chunkCount: $dropped packet(s) dropped")
                             }
 
                             if (chunkCount <= 5 || chunkCount % 500 == 0L) {
