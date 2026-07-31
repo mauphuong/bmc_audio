@@ -52,18 +52,38 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
     private external fun nativeReleaseInterface(fd: Int, interfaceNum: Int): Int
     private external fun nativeSetInterface(fd: Int, interfaceNum: Int, altSetting: Int): Int
     /**
-     * @param outDropped int[1] receiving the number of isochronous packets in
-     *   this URB that failed. Bytes lost that way break the contiguity the XOR
-     *   keystream depends on, so Dart re-acquires its position when it sees a
-     *   non-zero count.
+     * Allocate a pool of isochronous URBs and submit them all.
+     *
+     * Keeping several URBs in flight is what stops the endpoint going unpolled
+     * between reads; see the comment in usb_audio_iso.c.
+     *
+     * @return opaque handle, or 0 on failure.
      */
-    private external fun nativeIsoRead(
+    private external fun nativeIsoStart(
         fd: Int,
         endpoint: Int,
         maxPacket: Int,
         numPackets: Int,
+        numUrbs: Int
+    ): Long
+
+    /**
+     * Reap one completed URB, copy it into [out], and resubmit it.
+     *
+     * @param out reusable buffer of at least maxPacket*numPackets bytes.
+     * @param outDropped int[1] receiving the number of packets in this URB that
+     *   failed. Bytes lost that way break the contiguity the XOR keystream
+     *   depends on, so Dart re-acquires its position when it sees a non-zero
+     *   count.
+     * @return bytes written to [out], or -1 on error.
+     */
+    private external fun nativeIsoRead(
+        handle: Long,
+        out: ByteArray,
         outDropped: IntArray?
-    ): ByteArray?
+    ): Int
+
+    private external fun nativeIsoStop(handle: Long)
 
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
@@ -433,9 +453,13 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
                 Log.i(TAG, "nativeSetInterface(intf=$intfNum, alt=$altSetting): $nativeSetAlt")
             }
 
-            // Number of isoc packets per URB
-            // For 16kHz 16-bit mono: each packet ~32 bytes (1ms), read ~8ms at a time
+            // Isoc packets per URB, and how many URBs stay in flight.
+            // 16 kHz mono 16-bit is one ~32-byte packet per millisecond, so a
+            // URB covers 8 ms and the queue holds 64 ms. The depth is what
+            // matters: while this thread is copying one URB out, the other
+            // seven keep the endpoint polled.
             val numPackets = 8
+            val numUrbs = 8
 
             usbCaptureThread = Thread({
                 Log.i(TAG, "=== USB ISO capture thread started ===")
@@ -446,38 +470,35 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
                 var errorCount = 0
                 var totalBytes = 0L
 
+                var isoHandle = 0L
                 try {
-                    val droppedOut = IntArray(1)
+                    isoHandle = nativeIsoStart(fd, endpointAddr, maxPacketSize, numPackets, numUrbs)
+                    if (isoHandle == 0L) {
+                        Log.e(TAG, "nativeIsoStart failed")
+                        mainHandler.post {
+                            eventSink?.error("USB_ISO_FAIL", "Could not start isochronous capture", null)
+                        }
+                        isUsbCapturing = false
+                    } else {
+                        Log.i(TAG, "ISO queue: $numUrbs URBs x $numPackets packets = ${numUrbs * numPackets} ms")
+                    }
 
-                    while (isUsbCapturing) {
+                    val droppedOut = IntArray(1)
+                    // Reused across reads so the capture loop allocates nothing
+                    // per URB. Only the per-chunk copy handed to the event sink
+                    // is allocated, because it outlives this iteration.
+                    val scratch = ByteArray(maxPacketSize * numPackets)
+                    var droppedTotal = 0L
+
+                    while (isUsbCapturing && isoHandle != 0L) {
                         droppedOut[0] = 0
-                        val data = nativeIsoRead(fd, endpointAddr, maxPacketSize, numPackets, droppedOut)
+                        val n = nativeIsoRead(isoHandle, scratch, droppedOut)
                         val dropped = droppedOut[0]
 
-                        if (data != null && data.isNotEmpty()) {
-                            chunkCount++
-                            totalBytes += data.size
-                            errorCount = 0
-
-                            val payload = mapOf<String, Any>(
-                                "pcm" to data,
-                                "dropped" to dropped
-                            )
-                            mainHandler.post {
-                                eventSink?.success(payload)
-                            }
-
-                            if (dropped > 0) {
-                                Log.w(TAG, "ISO chunk #$chunkCount: $dropped packet(s) dropped")
-                            }
-
-                            if (chunkCount <= 5 || chunkCount % 500 == 0L) {
-                                Log.i(TAG, "ISO chunk #$chunkCount: ${data.size} bytes (total=$totalBytes)")
-                            }
-                        } else {
+                        if (n < 0) {
                             errorCount++
                             if (errorCount <= 5) {
-                                Log.e(TAG, "nativeIsoRead returned ${if (data == null) "null" else "empty"} (#$errorCount)")
+                                Log.e(TAG, "nativeIsoRead failed (#$errorCount)")
                             }
                             if (errorCount > 50) {
                                 Log.e(TAG, "Too many ISO read errors, stopping")
@@ -487,7 +508,32 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
                                 }
                                 break
                             }
-                            Thread.sleep(1)
+                            continue
+                        }
+
+                        errorCount = 0
+                        if (dropped > 0) droppedTotal += dropped
+
+                        if (n > 0 || dropped > 0) {
+                            chunkCount++
+                            totalBytes += n
+
+                            val payload = mapOf<String, Any>(
+                                "pcm" to scratch.copyOf(n),
+                                "dropped" to dropped
+                            )
+                            mainHandler.post {
+                                eventSink?.success(payload)
+                            }
+
+                            if (dropped > 0) {
+                                Log.w(TAG, "ISO chunk #$chunkCount: $dropped packet(s) dropped " +
+                                        "(total $droppedTotal)")
+                            }
+                            if (chunkCount <= 5 || chunkCount % 500 == 0L) {
+                                Log.i(TAG, "ISO chunk #$chunkCount: $n bytes " +
+                                        "(total=$totalBytes, dropped=$droppedTotal)")
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -496,6 +542,7 @@ class BmcAudioPlugin : FlutterPlugin, MethodCallHandler, EventChannel.StreamHand
                         eventSink?.error("USB_EXCEPTION", "${e.message}", null)
                     }
                 } finally {
+                    if (isoHandle != 0L) nativeIsoStop(isoHandle)
                     // Release interface
                     nativeReleaseInterface(fd, intfNum)
                     Log.i(TAG, "=== ISO capture ended: $chunkCount chunks, $totalBytes bytes ===")

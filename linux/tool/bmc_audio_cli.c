@@ -164,19 +164,56 @@ static void write_wav(const char *path, const uint8_t *pcm, size_t n) {
 // ── Capture state ────────────────────────────────────────────────────────
 static uint8_t *g_buf; static size_t g_cap, g_len; static volatile int g_run = 1;
 
+// Transport health. The payload size histogram is the direct read-out of the
+// firmware's asynchronous rate controller: it steers the capture ring towards
+// a target fill level by sending one sample more or less than nominal, so a
+// healthy stream shows mostly 32-byte packets with a sprinkling of 30 and 34.
+// All-32 means the controller never engages; a lopsided split means the device
+// and host clocks are further apart than one sample per frame can correct.
+#define PKT_HIST_MAX 40
+static unsigned long g_pkt_hist[PKT_HIST_MAX + 1];
+static unsigned long g_pkt_oversize, g_pkt_zero, g_pkt_err, g_pkt_ok;
+
 static void LIBUSB_CALL cb(struct libusb_transfer *x) {
   if (!g_run) return;
   for (int i = 0; i < x->num_iso_packets; i++) {
     struct libusb_iso_packet_descriptor *d = &x->iso_packet_desc[i];
-    if (d->status == LIBUSB_TRANSFER_COMPLETED && d->actual_length > 0) {
-      unsigned char *p = libusb_get_iso_packet_buffer_simple(x, i);
-      if (g_len + d->actual_length <= g_cap) {
-        memcpy(g_buf + g_len, p, d->actual_length);
-        g_len += d->actual_length;
-      }
+    if (d->status != LIBUSB_TRANSFER_COMPLETED) { g_pkt_err++; continue; }
+
+    if (d->actual_length == 0) {
+      // Legitimate on an asynchronous endpoint: the device had nothing ready
+      // for that frame and its keystream did not advance either.
+      g_pkt_zero++;
+      continue;
+    }
+
+    g_pkt_ok++;
+    if (d->actual_length <= PKT_HIST_MAX) g_pkt_hist[d->actual_length]++;
+    else g_pkt_oversize++;
+
+    unsigned char *p = libusb_get_iso_packet_buffer_simple(x, i);
+    if (g_len + d->actual_length <= g_cap) {
+      memcpy(g_buf + g_len, p, d->actual_length);
+      g_len += d->actual_length;
     }
   }
   if (g_run) libusb_submit_transfer(x);
+}
+
+static void print_transport_stats(void) {
+  printf("\n── Transport ──────────────────────────────────────────\n");
+  printf("packets: %lu ok, %lu zero-length, %lu failed\n",
+         g_pkt_ok, g_pkt_zero, g_pkt_err);
+  if (g_pkt_err)
+    printf("  WARNING: %lu failed packet(s) — each one desynchronises the "
+           "keystream\n", g_pkt_err);
+
+  printf("payload size histogram (bytes -> packets):\n");
+  for (int i = 0; i <= PKT_HIST_MAX; i++)
+    if (g_pkt_hist[i])
+      printf("  %2d bytes (%2d samples): %8lu  %5.1f%%\n", i, i / 2,
+             g_pkt_hist[i], 100.0 * g_pkt_hist[i] / (double)(g_pkt_ok ? g_pkt_ok : 1));
+  if (g_pkt_oversize) printf("  >%d bytes: %lu\n", PKT_HIST_MAX, g_pkt_oversize);
 }
 
 // Scan for the audio-streaming (class=1/subclass=2) iso IN endpoint.
@@ -258,6 +295,8 @@ int main(int argc, char **argv) {
   libusb_close(h); libusb_exit(ctx);
 
   printf("Captured %zu bytes (~%.2fs)\n", g_len, g_len / 32000.0);
+  print_transport_stats();
+  printf("\n── Decrypt ────────────────────────────────────────────\n");
   double raw = score_audio(g_buf, g_len);
   double best; uint32_t off = search_offset(g_buf, g_len, 16000, &best);
   uint8_t *dec = malloc(g_len); memcpy(dec, g_buf, g_len);
