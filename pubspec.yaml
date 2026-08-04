@@ -1,6 +1,6 @@
 name: bmc_audio
 description: "BMC Audio - Capture and decrypt audio from BMC USB Audio (UAC2.0) device with XOR-based encryption."
-version: 0.1.0
+version: 0.2.0
 homepage: https://github.com/bmctechvn/bmc_audio
 
 environment:
