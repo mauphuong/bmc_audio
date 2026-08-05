@@ -51,3 +51,4 @@ library;
 export 'src/audio_crypto.dart';
 export 'src/audio_decoder.dart';
 export 'src/audio_device.dart';
+export 'src/audio_stats.dart';

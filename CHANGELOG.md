@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.2.1
+
+Fixes iOS transmitting noise instead of audio when a call is answered from the
+lock screen with the device already plugged in.
+
+### The bug
+
+CCID is the only bit-exact capture path on iOS — CoreAudio's Float32 pipeline
+resamples, which destroys the XOR keystream. The decoder chose it with:
+
+```dart
+useIosCcid = !isAndroid && resolvedDecrypt && (device?.isBmc ?? false);
+```
+
+`isBmc` came solely from matching the AVAudioSession port name against
+`s-usb` / `bmc audio` / `aio` / `bmc mic`. In the background the session belongs
+to CallKit, `availableInputs` yields nothing, and the lookup returns no device
+at all — so the condition went false while decryption stayed on. Capture then
+ran over AVAudioEngine and XOR-ed a resampled stream: white noise, sent to the
+far end for the whole call. Nothing failed. Capture started, chunks flowed, the
+first chunk satisfied the caller's readiness check, and the call connected.
+
+Two further faults made the background case worse. `listAudioDevices()`
+reconfigured and activated the shared session purely to enumerate, disturbing
+the route CallKit had set for the call; and `stopCcidCapture()` tore the session
+down unconditionally, so the decoder reset that hosts perform before every call
+deactivated a session CallKit owned — which drops the USB port from
+`currentRoute` and reads as a phantom detach.
+
+### Fixed
+
+- **Device identity from IORegistry, not port names.** `listAudioDevices()` asks
+  IOKit for VID `0x1FC9` first; that works with no audio session and on a locked
+  device. A USB audio port is reported as BMC whenever the hardware is on the
+  bus, and when the session exposes no port at all the device is still reported,
+  synthesised from the registry. USB product strings are no longer trusted to
+  contain a recognisable name.
+- **Decryption implies CCID on iOS.** `useIosCcid` is now `isIOS && decrypt`.
+  Device detection no longer sits between "decrypt was requested" and "use the
+  only path that can honour it". Failing to open CCID raises; guessing does not.
+- **Tripwire against lossy decryption.** Reaching the platform capture path with
+  decryption on now throws on iOS and warns elsewhere, so this class of bug
+  reports itself instead of sounding like broken hardware.
+- **`isBmc` from the native layer is honoured.** Dart recomputed it from the
+  name and discarded what the platform reported.
+- **Session ownership.** Device listing leaves an existing `.playAndRecord`
+  session untouched and only restores what it configured itself;
+  `stopCcidCapture()` is a no-op when nothing is capturing.
+
 ## 0.2.0
 
 Fixes the failure where audio turned to permanent noise part-way through a
@@ -41,6 +90,18 @@ kept eight transfers in flight).
   so recovery starts immediately rather than waiting for the score to degrade.
 - **Disconnect detection (Linux)**: a device that disappears mid-capture now
   raises `USB_DISCONNECTED` instead of the stream silently going quiet.
+- **iOS background noise (firmware fix)**: the CCID audio path prepends the
+  sample index to every read so the host always knows which keystream offset
+  applies. That index and the keystream itself were reset independently — the
+  CCID start-stream command reset both, but `UAC2_AppPrimeStream()` reset only
+  the keystream. Priming runs on every SET_INTERFACE to the streaming alt
+  setting, which on iOS happens whenever the `AVAudioEngine` holding the
+  endpoint open is restarted: session interruptions, route changes, moving to
+  the background. After such a restart the ring still reported a large sample
+  index for data that had been encrypted starting from zero again, and
+  everything the host decrypted was noise until the app restarted the stream.
+  The ring is now flushed and re-based whenever the keystream resets.
+  **Requires reflashing the device.**
 - **Offset search**: no longer assumes packets carry exactly 16 samples. The
   firmware's audio endpoint is asynchronous and varies the payload between 15
   and 17 samples to track the host clock, so the cumulative offset can be any
@@ -83,6 +144,24 @@ stream.listen(
 **2. Rebuild the native library.** The Android JNI entry points changed, so a
 stale `libbmc_usb_audio.so` will fail to link at runtime. Run `flutter clean`
 before the first build against this version.
+
+**3. iOS only — declare the background audio mode.** Add to `Info.plist`:
+
+```xml
+<key>UIBackgroundModes</key>
+<array>
+    <string>audio</string>
+</array>
+```
+
+The UAC endpoint on iOS is kept alive by an `AVAudioEngine` instance; the
+firmware only produces packets while the host is streaming, and the CCID bridge
+only has data to read while that is true. Without this key iOS suspends the app
+when it goes to the background or the screen locks, the engine stops, and audio
+stops with it. `NSMicrophoneUsageDescription` is required as well.
+
+**4. iOS only — reflash the firmware.** See below; the fix for background noise
+is on the device side and cannot be worked around in the app.
 
 Nothing else in the API changed, and no configuration is required to get the
 recovery behaviour — it is on by default.

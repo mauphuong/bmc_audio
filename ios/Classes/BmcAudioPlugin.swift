@@ -282,30 +282,48 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         let session = AVAudioSession.sharedInstance()
         var devices: [[String: Any]] = []
 
-        // Remember if we were already capturing — if so, don't touch the session afterwards.
-        let wasCaptureActive = isCapturing
+        // ── Ground truth first: IORegistry ──
+        // Port names are an unreliable way to recognise the BMC device (the USB
+        // product string is not guaranteed to contain "S-USB"/"AIO"), and
+        // AVAudioSession exposes no inputs at all while the app is in the
+        // background with a CallKit-owned session. IORegistry needs neither an
+        // active audio session nor an unlocked device, so ask it first and use
+        // the answer to override the name heuristic below.
+        let bmcUsb = BmcUsbHelper.listUsbDevices().first {
+            (($0["vendorId"] as? NSNumber)?.intValue ?? 0) == 0x1FC9
+        }
+        if let bmcUsb = bmcUsb {
+            NSLog("BmcAudioPlugin: IORegistry sees BMC device \"\(bmcUsb["productName"] as? String ?? "")\" " +
+                  "vid=0x1FC9 pid=0x\(String(((bmcUsb["productId"] as? NSNumber)?.intValue ?? 0), radix: 16))")
+        }
 
         // Activate session so iOS exposes USB audio ports in availableInputs.
         // Without this, only built-in mic shows up even when USB device is connected.
-        do {
-            try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .allowBluetooth])
-            try session.setActive(true)
-            NSLog("BmcAudioPlugin: Session activated for device listing")
-        } catch {
-            NSLog("BmcAudioPlugin: Session activation for device listing failed: \(error)")
+        //
+        // Skip entirely when the session is already .playAndRecord: that means a
+        // call owns it (CallKit configured .playAndRecord/.default before
+        // fulfilling the answer action). Re-configuring it here would drop the
+        // preferred USB input and reset the route mid-call.
+        var didConfigureSession = false
+        if session.category == .playAndRecord {
+            NSLog("BmcAudioPlugin: Session already .playAndRecord (call active?) — listing without touching it")
+        } else {
+            do {
+                try session.setCategory(.playAndRecord, options: [.defaultToSpeaker, .allowBluetooth])
+                try session.setActive(true)
+                didConfigureSession = true
+                NSLog("BmcAudioPlugin: Session activated for device listing")
+            } catch {
+                NSLog("BmcAudioPlugin: Session activation for device listing failed: \(error)")
+            }
         }
 
-        // List available input ports
-        guard let availableInputs = session.availableInputs else {
-            // ✅ Reset session even on early return
-            if !wasCaptureActive { _resetSessionAfterListing() }
-            return devices
-        }
-
-        for (index, port) in availableInputs.enumerated() {
+        for (index, port) in (session.availableInputs ?? []).enumerated() {
             let isUsb = port.portType == .usbAudio
             let name = port.portName
-            let isBmc = looksLikeBmc(name: name)
+            // A USB audio port while the BMC hardware is on the bus IS the BMC
+            // device — do not let the name heuristic veto that.
+            let isBmc = looksLikeBmc(name: name) || (isUsb && bmcUsb != nil)
 
             var device: [String: Any] = [
                 "id": String(index),
@@ -317,6 +335,11 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                 "productName": name,
             ]
 
+            if isBmc, let bmcUsb = bmcUsb {
+                device["vendorId"] = bmcUsb["vendorId"] ?? 0x1FC9
+                device["productId"] = bmcUsb["productId"] ?? 0
+            }
+
             // Include UID for precise device selection
             device["uid"] = port.uid
 
@@ -324,9 +347,34 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
             NSLog("BmcAudioPlugin: Device [\(index)] \"\(name)\" type=\(port.portType.rawValue) usb=\(isUsb) bmc=\(isBmc)")
         }
 
-        // ✅ CRITICAL: Release microphone after listing if not actively capturing.
-        // Without this, the yellow mic indicator stays on from app launch.
-        if !wasCaptureActive {
+        // The device is plugged in but AVAudioSession did not expose it (locked
+        // screen / background / CallKit owns the session). Synthesise an entry so
+        // callers still resolve a BMC device: on iOS the capture itself runs over
+        // CCID, which does not need an AVAudioSession input port to exist.
+        if let bmcUsb = bmcUsb,
+           !devices.contains(where: { ($0["isBmc"] as? Bool) == true }) {
+            let rawName = (bmcUsb["productName"] as? String) ?? ""
+            let productName = rawName.isEmpty ? "BMC S-USB" : rawName
+            devices.append([
+                // Deliberately out of range for availableInputs — this is a
+                // hardware hint, not a selectable AVAudioSession port index.
+                "id": "-1",
+                "name": "\(productName) [IORegistry]",
+                "type": AVAudioSession.Port.usbAudio.rawValue,
+                "isUsb": true,
+                "isBmc": true,
+                "isSource": true,
+                "productName": productName,
+                "vendorId": bmcUsb["vendorId"] ?? 0x1FC9,
+                "productId": bmcUsb["productId"] ?? 0,
+            ])
+            NSLog("BmcAudioPlugin: No BMC port in availableInputs — synthesised device from IORegistry")
+        }
+
+        // ✅ CRITICAL: Release microphone after listing if we were the one that
+        // grabbed it. Without this, the yellow mic indicator stays on from app
+        // launch. Never reset a session we did not configure.
+        if didConfigureSession && !isCapturing {
             _resetSessionAfterListing()
         }
 
@@ -340,8 +388,10 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     private func _resetSessionAfterListing() {
         let session = AVAudioSession.sharedInstance()
 
-        // Nếu đang ở .playAndRecord rồi (từ capture hoặc call), không cần reset
-        if session.category == .playAndRecord && isCapturing {
+        // Chỉ được gọi khi chính listAudioDevices() đã configure session (xem
+        // didConfigureSession). Vẫn giữ guard này phòng trường hợp capture bắt
+        // đầu ngay giữa lúc liệt kê device.
+        if isCapturing {
             NSLog("BmcAudioPlugin: Skip reset — capture is active")
             return
         }
@@ -420,7 +470,9 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
                 let bmcPort = availableInputs.first { looksLikeBmc(name: $0.portName) }
                 let usbPort = availableInputs.first { $0.portType == .usbAudio }
 
-                if let deviceId = deviceId, deviceId < availableInputs.count {
+                // deviceId may be -1 (the synthesised IORegistry entry) — that is a
+                // hardware hint, not a port index, so fall through to bmc/usb pick.
+                if let deviceId = deviceId, deviceId >= 0, deviceId < availableInputs.count {
                     preferredPort = availableInputs[deviceId]
                 } else {
                     preferredPort = bmcPort ?? usbPort
@@ -812,6 +864,15 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
     /// Stop CCID audio capture.
     private func stopCcidCapture() {
+        // Callers routinely stop a capture that was never started — the Dart side
+        // resets the decoder before every call. Tearing the audio session down in
+        // that case deactivates a session CallKit owns, which drops the USB port
+        // from currentRoute and makes the host app see a phantom USB detach.
+        guard isCapturing || isCcidMode || ccidBridge.isConnected else {
+            NSLog("BmcAudioPlugin: CCID: stop requested but not capturing — leaving audio session alone")
+            return
+        }
+
         NSLog("BmcAudioPlugin: CCID: Stopping capture...")
         ccidBridge.stopStream()
         ccidBridge.disconnect()

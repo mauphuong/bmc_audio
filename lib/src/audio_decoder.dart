@@ -7,6 +7,7 @@ import 'package:flutter_recorder/flutter_recorder.dart';
 
 import 'audio_crypto.dart';
 import 'audio_device.dart';
+import 'audio_stats.dart';
 
 /// Audio format configuration for capture.
 class BmcAudioConfig {
@@ -188,6 +189,54 @@ class BmcAudioDecoder {
   /// Packets the native layer reported as lost since capture started.
   int get droppedPackets => _droppedPackets;
 
+  // ── Delivery accounting ──────────────────────────────────────────────
+  //
+  // Counting what actually reaches the listener is the only measurement that
+  // compares across platforms: iOS reads over the reliable CCID channel and
+  // Android over isochronous, so their transports have no common unit, but
+  // "how much of a second of audio did you deliver" applies to both.
+
+  int _samplesEmitted = 0;
+  DateTime? _captureStartedAt;
+  Timer? _statsTimer;
+
+  /// How often the decoder logs a health line while capturing.
+  static const Duration _statsInterval = Duration(seconds: 5);
+
+  /// Delivery statistics for the current session.
+  ///
+  /// Returns null before the first capture starts.
+  BmcAudioStats? get stats {
+    final started = _captureStartedAt;
+    if (started == null) return null;
+    final elapsed = DateTime.now().difference(started);
+    return BmcAudioStats(
+      elapsed: elapsed,
+      samplesEmitted: _samplesEmitted,
+      samplesExpected: elapsed.inMilliseconds * _config.sampleRate ~/ 1000,
+      droppedPackets: _droppedPackets,
+      resyncCount: _resyncCount,
+    );
+  }
+
+  /// Hand PCM to the listener, keeping the delivery count honest.
+  ///
+  /// Every path that produces audio goes through here — the first locked
+  /// window, ordinary chunks, and the window replayed after a re-acquisition —
+  /// so the count cannot drift from what was actually emitted.
+  void _emit(Uint8List pcm) {
+    _samplesEmitted += pcm.length ~/ 2;
+    _outputController?.add(pcm);
+  }
+
+  void _startStatsTimer() {
+    _statsTimer?.cancel();
+    _statsTimer = Timer.periodic(_statsInterval, (_) {
+      final s = stats;
+      if (s != null) _debug(s.toString());
+    });
+  }
+
   /// Optional debug callback — called with status messages.
   void Function(String message)? onDebug;
 
@@ -300,12 +349,19 @@ class BmcAudioDecoder {
             ? '$productName ($typeName)'
             : '$name ($typeName)';
 
+        // The native side may already know this is a BMC device from a source
+        // stronger than the name (iOS: IORegistry VID=0x1FC9). Never let the
+        // name heuristic override that — USB product strings are not guaranteed
+        // to contain "S-USB"/"AIO".
         final device = BmcAudioDevice(
           id: id,
           name: displayName,
           isUsb: isUsb,
-          isBmc: BmcAudioDevice.looksLikeBmc(displayName) ||
+          isBmc: (map['isBmc'] as bool? ?? false) ||
+              BmcAudioDevice.looksLikeBmc(displayName) ||
               BmcAudioDevice.looksLikeBmc(productName),
+          vendorId: map['vendorId'] as int?,
+          productId: map['productId'] as int?,
         );
 
         _debug('  [${device.id}] "${device.name}" usb=$isUsb');
@@ -538,6 +594,11 @@ class BmcAudioDecoder {
     _droppedPackets = 0;
     _resetHealth();
 
+    // Delivery accounting for this session.
+    _samplesEmitted = 0;
+    _captureStartedAt = DateTime.now();
+    _startStatsTimer();
+
     if (_hasNativePlugin) {
       _startCaptureNative(deviceId: deviceId, device: device);
     } else {
@@ -612,9 +673,15 @@ class BmcAudioDecoder {
             'device.name="${device?.name}", '
             'device.isUsb=${device?.isUsb}');
 
-        final bool useIosCcid = !_isAndroid &&
-            _resolvedDecrypt == true &&
-            (device?.isBmc ?? false);
+        // CCID is the ONLY bit-exact capture path on iOS, so decryption implies
+        // it. Gating on `device.isBmc` here used to mean that a device lookup
+        // failing — which it does while the app is backgrounded and CallKit owns
+        // the audio session, so AVAudioSession exposes no inputs — silently
+        // downgraded to AVAudioEngine while decryption stayed ON. That combination
+        // XORs a resampled Float32 stream and transmits white noise, with no
+        // error anywhere: capture starts, chunks flow, the call proceeds.
+        // Failing to open CCID is loud (see the throw below); guessing is not.
+        final bool useIosCcid = _isIOS && _resolvedDecrypt == true;
 
         _debug('→ useIosCcid=$useIosCcid');
 
@@ -636,6 +703,22 @@ class BmcAudioDecoder {
           _state = BmcCaptureState.capturing;
           _debug('✓ CCID capture started: $result');
         } else {
+          // Structurally unreachable on iOS (useIosCcid covers every decrypting
+          // case). Kept as a tripwire: emitting XOR-ed CoreAudio output is worse
+          // than no audio at all, because it sounds like a hardware fault and
+          // costs days to trace back to a capture-path decision.
+          if (_isIOS && _resolvedDecrypt) {
+            throw StateError(
+              'decrypt=ON but CCID path not selected — refusing lossy capture '
+              '(device=${device?.name}, isBmc=${device?.isBmc})',
+            );
+          }
+          if (_resolvedDecrypt) {
+            _debug('⚠️ decrypt=ON over the platform capture path — this is only '
+                'bit-exact when the OS does not resample (Android USB Direct is '
+                'the reliable path); output may be noise.');
+          }
+
           _debug('${_isAndroid ? "Android" : "iOS"}: Native capture mode');
 
           final int? parsedDeviceId = deviceId != null
@@ -809,7 +892,7 @@ class BmcAudioDecoder {
 
           _crypto!.sampleIndex = sampleIdx;
           _crypto!.transformPcm16le(pcmData);
-          _outputController?.add(pcmData);
+          _emit(pcmData);
           return;
         }
 
@@ -871,7 +954,7 @@ class BmcAudioDecoder {
             _crypto!.reset();
             _crypto!.sampleIndex = bestOffset;
             _crypto!.transformPcm16le(combined);
-            _outputController?.add(combined);
+            _emit(combined);
             _debug('✓ Offset LOCKED at $bestOffset');
             _offsetSearchBuffer.clear();
             _offsetSearchBytes = 0;
@@ -888,7 +971,7 @@ class BmcAudioDecoder {
         _crypto!.transformPcm16le(rawPcm);
         _checkHealth(rawPcm);
       }
-      _outputController?.add(rawPcm);
+      _emit(rawPcm);
     } catch (e) {
       _debug('Error processing audio: $e');
     }
@@ -997,7 +1080,7 @@ class BmcAudioDecoder {
         '(was $_resyncExpectedIndex, drift ${best - _resyncExpectedIndex}, '
         'corr ${score.toStringAsFixed(3)}, resync #$_resyncCount)');
 
-    _outputController?.add(
+    _emit(
       BmcAudioCrypto.transform(combined, seed: _config.seed, startIndex: best),
     );
   }
@@ -1068,6 +1151,13 @@ class BmcAudioDecoder {
 
     _state = BmcCaptureState.stopping;
 
+    // Report the session's delivery before tearing it down: this is the line
+    // that says how much audio actually made it through.
+    _statsTimer?.cancel();
+    _statsTimer = null;
+    final finalStats = stats;
+    if (finalStats != null) _debug('session ended — $finalStats');
+
     try {
       if (_hasNativePlugin) {
         // Android and iOS: stop via native plugin
@@ -1128,6 +1218,9 @@ class BmcAudioDecoder {
 
   /// Release all resources.
   void dispose() {
+    _statsTimer?.cancel();
+    _statsTimer = null;
+
     if (_state != BmcCaptureState.idle) {
       stopCapture();
     }
