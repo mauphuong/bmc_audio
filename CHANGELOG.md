@@ -49,6 +49,16 @@ deactivated a session CallKit owned — which drops the USB port from
   session untouched and only restores what it configured itself;
   `stopCcidCapture()` is a no-op when nothing is capturing.
 
+### Also
+
+- **`flutter_recorder` capped below 1.2.0.** 1.2.0 added Opus encoding and began
+  vendoring `opus.xcframework` on iOS, which collides by name with
+  `opus_flutter_ios` in any host app that has both — `pod install` fails with
+  "the 'Pods-Runner' target has frameworks with conflicting names". This package
+  uses `flutter_recorder` only for desktop capture; no iOS code path touches it,
+  so the constraint is `>=1.1.2 <1.2.0` until upstream namespaces the iOS
+  framework the way it already did for the Android libraries.
+
 ## 0.2.0
 
 Fixes the failure where audio turned to permanent noise part-way through a
