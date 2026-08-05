@@ -49,15 +49,25 @@ deactivated a session CallKit owned — which drops the USB port from
   session untouched and only restores what it configured itself;
   `stopCcidCapture()` is a no-op when nothing is capturing.
 
-### Also
+### Removed
 
-- **`flutter_recorder` capped below 1.2.0.** 1.2.0 added Opus encoding and began
-  vendoring `opus.xcframework` on iOS, which collides by name with
-  `opus_flutter_ios` in any host app that has both — `pod install` fails with
-  "the 'Pods-Runner' target has frameworks with conflicting names". This package
-  uses `flutter_recorder` only for desktop capture; no iOS code path touches it,
-  so the constraint is `>=1.1.2 <1.2.0` until upstream namespaces the iOS
-  framework the way it already did for the Android libraries.
+- **`flutter_recorder`, and with it desktop capture.**
+
+  From 1.2.0 the package vendors `opus.xcframework` on iOS. Host apps that also
+  depend on `opus_flutter_ios` — which vendors a framework of the same name —
+  cannot run `pod install` at all: *"the 'Pods-Runner' target has frameworks with
+  conflicting names: opus.xcframework"*. Upstream namespaced its Android
+  libraries as `libfr_ogg`/`libfr_opus` for exactly this reason; the iOS
+  framework kept the bare name.
+
+  `flutter_recorder` backed desktop capture only. Android, iOS and Linux go
+  through native capture paths and never touched it, so every iOS build was
+  paying — and now failing — for a dependency none of its code uses.
+
+  **Breaking on Windows and macOS**: the stream returned by `startCapture()`
+  emits `UnsupportedError` there, and device enumeration returns empty. Callers
+  on those platforms need the commit reverted, or a desktop backend that does
+  not put a CocoaPods dependency in front of iOS.
 
 ## 0.2.0
 

@@ -3,7 +3,6 @@ import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_recorder/flutter_recorder.dart';
 
 import 'audio_crypto.dart';
 import 'audio_device.dart';
@@ -100,7 +99,6 @@ class BmcAudioDecoder {
   StreamSubscription? _audioSubscription;
 
   /// Whether the recorder has been initialized (non-Android only).
-  bool _recorderInitialized = false;
 
   /// Resolved decrypt state (set in startCapture, used by _processRawPcm).
   bool _resolvedDecrypt = false;
@@ -443,44 +441,17 @@ class BmcAudioDecoder {
   }
 
 
-  /// Desktop: list devices via flutter_recorder.
+  /// Desktop: device enumeration is not available in this build.
+  ///
+  /// Desktop capture went through `flutter_recorder`, which was dropped in
+  /// 0.2.1 — see the note in pubspec.yaml. Enumeration degrades to "no devices"
+  /// rather than throwing, because callers use it as a plug-detection probe and
+  /// a throw there would take the host UI down. Capture itself throws.
   Future<List<BmcAudioDevice>> _listDevicesDesktop(
       {bool usbOnly = false}) async {
-    try {
-      if (!_recorderInitialized) {
-        _debug('Initializing recorder for device listing...');
-        try {
-          await Recorder.instance.init();
-          _recorderInitialized = true;
-          _debug('Recorder initialized OK');
-        } catch (e) {
-          _debug('Recorder init error: $e');
-          // Try listing anyway — some implementations don't need init
-        }
-      }
-
-      final devices = Recorder.instance.listCaptureDevices();
-      _debug('Desktop: Found ${devices.length} capture devices:');
-
-      final result = <BmcAudioDevice>[];
-      for (final device in devices) {
-        final bmcDevice = BmcAudioDevice.fromRecorderDevice(
-          id: device.id.toString(),
-          name: device.name,
-        );
-        _debug('  [${device.id}] "${device.name}" '
-            'usb=${bmcDevice.isUsb} bmc=${bmcDevice.isBmc}');
-
-        if (!usbOnly || bmcDevice.isUsb) {
-          result.add(bmcDevice);
-        }
-      }
-
-      return result;
-    } catch (e) {
-      _debug('Error listing desktop devices: $e');
-      return [];
-    }
+    _debug('Desktop device enumeration unavailable — this build has no desktop '
+        'capture backend (flutter_recorder removed).');
+    return const [];
   }
 
   /// Auto-detect a BMC USB device from available capture devices.
@@ -788,82 +759,29 @@ class BmcAudioDecoder {
   }
 
 
-  /// Desktop: start capture via flutter_recorder.
+  /// Desktop: capture is not available in this build.
+  ///
+  /// `flutter_recorder` was the only desktop backend and was dropped in 0.2.1
+  /// (it began vendoring `opus.xcframework`, which collides with
+  /// `opus_flutter_ios` in host apps that use both). Restoring desktop support
+  /// means reverting that commit, or giving desktop its own backend so iOS
+  /// stops paying for a dependency it never uses.
+  ///
+  /// The failure is delivered on the stream rather than thrown: this is called
+  /// without `await` from [startCapture], which has already returned the stream
+  /// to the caller, so a bare throw would surface as an unhandled async error
+  /// instead of reaching the caller's `onError`.
   Future<void> _startCaptureDesktop(String? deviceId) async {
-    try {
-      if (_recorderInitialized) {
-        _debug('Deinit previous recorder...');
-        try {
-          Recorder.instance.deinit();
-        } catch (_) {}
-        _recorderInitialized = false;
-      }
-
-      final int? parsedDeviceId =
-          deviceId != null ? int.tryParse(deviceId) : null;
-
-      _debug('Init recorder: sampleRate=${_config.sampleRate}, '
-          'format=s16le, channels=${_config.channels}, '
-          'deviceID=${parsedDeviceId ?? "default"}');
-
-      await Recorder.instance.init(
-        deviceID: parsedDeviceId ?? -1,
-        sampleRate: _config.sampleRate,
-        channels: _config.channels == 1
-            ? RecorderChannels.mono
-            : RecorderChannels.stereo,
-        format: PCMFormat.s16le,
-      );
-      _recorderInitialized = true;
-      _debug('Recorder initialized OK');
-
-      int chunkCount = 0;
-      _audioSubscription = Recorder.instance.uint8ListStream.listen(
-        (data) {
-          chunkCount++;
-          final rawData = Uint8List.fromList(data.rawData);
-          if (chunkCount <= 5 || chunkCount % 100 == 0) {
-            // Diagnostic: compute min/max/RMS of raw int16 samples
-            int minVal = 32767, maxVal = -32768;
-            double sumSq = 0;
-            final sampleCount = rawData.length ~/ 2;
-            for (int i = 0; i < sampleCount; i++) {
-              int s = rawData[i * 2] | (rawData[i * 2 + 1] << 8);
-              if (s > 32767) s -= 65536;
-              if (s < minVal) minVal = s;
-              if (s > maxVal) maxVal = s;
-              sumSq += s * s;
-            }
-            final rms = sampleCount > 0 ? (sumSq / sampleCount) : 0.0;
-            _debug('Chunk #$chunkCount: ${rawData.length}B, '
-                'min=$minVal max=$maxVal rms=${rms.toStringAsFixed(0)}');
-          }
-          _processRawPcm(rawData);
-        },
-        onError: (error) {
-          _debug('Stream error: $error');
-          _outputController?.addError(error);
-        },
-        onDone: () {
-          _debug('Stream done');
-          stopCapture();
-        },
-      );
-
-      _debug('Starting recorder...');
-      Recorder.instance.start();
-      _debug('Starting data streaming...');
-      Recorder.instance.startStreamingData();
-
-      _state = BmcCaptureState.capturing;
-      _debug('✓ Desktop capture started');
-    } catch (e, stack) {
-      _debug('FAILED to start desktop capture: $e');
-      _debug('Stack: ${stack.toString().split('\n').take(3).join(' | ')}');
-      _state = BmcCaptureState.idle;
-      _outputController?.addError(e);
-      _outputController?.close();
-    }
+    _state = BmcCaptureState.idle;
+    final error = UnsupportedError(
+      'Desktop capture is not available in this build of bmc_audio: the '
+      'flutter_recorder backend was removed in 0.2.1. Android, iOS and Linux '
+      'use native capture paths and are unaffected.',
+    );
+    _debug('$error');
+    _outputController?.addError(error);
+    await _outputController?.close();
+    _outputController = null;
   }
 
   /// Process raw PCM16LE data: decrypt if enabled, forward to output stream.
@@ -1160,16 +1078,9 @@ class BmcAudioDecoder {
 
     try {
       if (_hasNativePlugin) {
-        // Android and iOS: stop via native plugin
+        // Android, iOS and Linux: stop via native plugin.
+        // Desktop needs nothing — it has no capture backend in this build.
         await _methodChannel.invokeMethod('stopCapture');
-      } else {
-        // Desktop: stop flutter_recorder
-        try {
-          Recorder.instance.stopStreamingData();
-          Recorder.instance.stop();
-          Recorder.instance.deinit();
-          _recorderInitialized = false;
-        } catch (_) {}
       }
 
       await _audioSubscription?.cancel();
@@ -1223,13 +1134,6 @@ class BmcAudioDecoder {
 
     if (_state != BmcCaptureState.idle) {
       stopCapture();
-    }
-
-    if (!_hasNativePlugin && _recorderInitialized) {
-      try {
-        Recorder.instance.deinit();
-      } catch (_) {}
-      _recorderInitialized = false;
     }
   }
 }

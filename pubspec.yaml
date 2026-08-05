@@ -14,18 +14,16 @@ dependencies:
     sdk: flutter
   web: ^1.0.0
   plugin_platform_interface: ^2.0.2
-  # Desktop capture only (Windows/macOS) — iOS, Android and Linux never touch it.
+  # NOTE: `flutter_recorder` was removed in 0.2.1. It backed desktop capture
+  # (Windows/macOS) only — Android, iOS and Linux use native capture paths and
+  # never touched it. From 1.2.0 it vendors `opus.xcframework` on iOS, which
+  # collides by name with `opus_flutter_ios` and breaks `pod install` in any host
+  # app that has both. Rather than cap the version, we stopped making iOS pay for
+  # a dependency no iOS code path uses.
   #
-  # Ceiling is deliberate: 1.2.0 added Opus encoding and started vendoring
-  # `opus.xcframework` on iOS. Any host app that also depends on opus_flutter_ios
-  # (which vendors a framework of the same name) then fails at `pod install` with
-  # "the 'Pods-Runner' target has frameworks with conflicting names". We pay that
-  # cost on every iOS build for a dependency no iOS code path uses.
-  #
-  # Before lifting this: check whether flutter_recorder still names its iOS
-  # framework plainly `opus` — upstream renamed the Android libs to
-  # libfr_ogg/libfr_opus for exactly this reason, so the iOS side may follow.
-  flutter_recorder: '>=1.1.2 <1.2.0'
+  # Desktop capture therefore throws UnsupportedError in this build. To restore
+  # it, revert the commit that removed it — or, better, give desktop its own
+  # backend package so the dependency never reaches an iOS Podfile again.
 
 dev_dependencies:
   flutter_test:
