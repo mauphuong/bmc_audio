@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.2.2
+
+Fixes `CCID_CONNECT_FAILED` on iOS when a call arrives with the S-USB already
+plugged in, while the same device signs and reads files without trouble.
+
+### The bug
+
+`CcidAudioBridge.connect()` was a single shot: list the slots, take the first
+one that hands back a card, begin a session, and report failure the moment any
+of that does not work out. That is a race against the system.
+
+The CCID slot of the composite device is not continuously available. When a call
+starts on a device that is already plugged in, CallKit activates the audio
+session and iOS claims the UAC interface of the same device — CryptoTokenKit
+re-probes the card around that. For that window `slotNames` can be empty,
+`slot.state` is `.probing`, or `makeSmartCard()` returns nil. Plugging the device
+in *during* a call has none of this: the audio session is already up, nothing is
+re-attaching, and the first probe succeeds. Hence the asymmetric repro — the same
+call fails when the device was plugged in first and works when it is plugged in
+later.
+
+Nothing in the failure path said which stage failed. Slots that did not yield a
+card were skipped with a bare `continue`, and an empty slot list returned false
+without a line of log, so every cause arrived at the host as one opaque
+`Could not connect to smart card`.
+
+### Fixed
+
+- **Connect retries across the re-attach window.** `connect(maxAttempts:
+  retryDelay:)` probes 12 times at 250 ms — about three seconds — instead of
+  giving up on the first miss. `reconnect()` uses a shorter window because the
+  polling loop already wraps it in retries of its own.
+- **`slot.state` is checked.** `.validCard` is required before
+  `makeSmartCard()`; `.probing` is now a state to wait out rather than a silent
+  skip.
+- **Every failure path is named.** Slot list empty, `getSlot` nil or timed out,
+  wrong card state, `makeSmartCard()` nil, `beginSession` error — each is logged
+  and recorded in `lastConnectError`, which travels to Dart in the
+  `CCID_CONNECT_FAILED` message and details. A field report now says whether the
+  card was busy, absent, or still probing.
+- **`beginSession` no longer waits forever.** Another `TKSmartCard` holding the
+  card — a signing session that was not closed — made it queue indefinitely, and
+  the unbounded semaphore wait hung the calling thread with it. Both waits in
+  connect are bounded (3 s for `getSlot`, 5 s for `beginSession`).
+- **Connect runs off the platform thread.** Seconds of retries on the Flutter
+  platform thread would freeze the call screen, so `startCcidCapture` connects on
+  its own queue and resumes on main. A start whose connect was still running when
+  the call ended is invalidated by a token check, so it cannot come back and hold
+  the microphone and the card.
+
 ## 0.2.1
 
 Fixes iOS transmitting noise instead of audio when a call is answered from the

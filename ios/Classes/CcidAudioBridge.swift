@@ -51,54 +51,146 @@ class CcidAudioBridge {
 
     // MARK: - Connection
 
+    /// Human-readable reason the last `connect()` gave up — surfaced to Dart so
+    /// a failure in the field says *which* stage failed, not just "connect failed".
+    private(set) var lastConnectError = "not attempted"
+
     /// Find S-USB smart card slot and begin exclusive session.
-    func connect() -> Bool {
+    ///
+    /// The CCID slot of the composite device is briefly unusable while iOS
+    /// (re)attaches the device — most visibly when a call starts with the S-USB
+    /// already plugged in: CallKit activates the audio session, iOS claims the
+    /// UAC interface and CryptoTokenKit re-probes the card. During that window
+    /// `slotNames` can be empty, `slot.state` is `.probing`, or `makeSmartCard()`
+    /// returns nil. A single-shot connect loses that race and kills the call,
+    /// while plugging the device in *during* a call — everything already settled —
+    /// works. So retry over a bounded window instead of failing immediately.
+    ///
+    /// - Parameters:
+    ///   - maxAttempts: how many probes before giving up.
+    ///   - retryDelay: pause between probes.
+    func connect(maxAttempts: Int = 12, retryDelay: TimeInterval = 0.25) -> Bool {
+        for attempt in 1...max(1, maxAttempts) {
+            if tryConnectOnce(attempt: attempt, of: maxAttempts) {
+                return true
+            }
+            if attempt < maxAttempts {
+                Thread.sleep(forTimeInterval: retryDelay)
+            }
+        }
+
+        NSLog("[\(CcidAudioBridge.tag)] \u{274C} Connect failed after \(maxAttempts) attempts: \(lastConnectError)")
+        return false
+    }
+
+    /// One connect probe. Every failure path records `lastConnectError` and logs —
+    /// silent `continue`s here used to make field failures undiagnosable.
+    private func tryConnectOnce(attempt: Int, of maxAttempts: Int) -> Bool {
         guard let manager = TKSmartCardSlotManager.default else {
+            lastConnectError = "TKSmartCardSlotManager unavailable"
             NSLog("[\(CcidAudioBridge.tag)] TKSmartCardSlotManager not available")
             return false
         }
 
         let slotNames = manager.slotNames
-        NSLog("[\(CcidAudioBridge.tag)] Available slots: \(slotNames)")
+        NSLog("[\(CcidAudioBridge.tag)] Connect attempt \(attempt)/\(maxAttempts), slots: \(slotNames)")
+
+        if slotNames.isEmpty {
+            lastConnectError = "no CCID slot exposed (device re-enumerating or not attached)"
+            return false
+        }
+
+        var lastReason = "no slot yielded a session"
 
         for slotName in slotNames {
-            let semaphore = DispatchSemaphore(value: 0)
-            var foundSlot: TKSmartCardSlot?
-
+            let slotBox = Box<TKSmartCardSlot?>(nil)
+            let slotSem = DispatchSemaphore(value: 0)
             manager.getSlot(withName: slotName) { slot in
-                foundSlot = slot
-                semaphore.signal()
+                slotBox.set(slot)
+                slotSem.signal()
             }
-            semaphore.wait()
+            if slotSem.wait(timeout: .now() + 3.0) == .timedOut {
+                lastReason = "getSlot(\(slotName)) timed out"
+                NSLog("[\(CcidAudioBridge.tag)] \u{26A0}\u{FE0F} \(lastReason)")
+                continue
+            }
 
-            guard let slot = foundSlot,
-                  let card = slot.makeSmartCard() else { continue }
+            guard let slot = slotBox.get() else {
+                lastReason = "getSlot(\(slotName)) returned nil"
+                NSLog("[\(CcidAudioBridge.tag)] \u{26A0}\u{FE0F} \(lastReason)")
+                continue
+            }
 
-            smartCard = card
+            NSLog("[\(CcidAudioBridge.tag)] Slot \(slotName) state=\(CcidAudioBridge.describe(slot.state))")
+
+            // .probing is the transient state we are retrying for; the others mean
+            // the card genuinely is not usable on this attempt.
+            guard slot.state == .validCard else {
+                lastReason = "slot \(slotName) state=\(CcidAudioBridge.describe(slot.state))"
+                continue
+            }
+
+            guard let card = slot.makeSmartCard() else {
+                lastReason = "makeSmartCard() nil on \(slotName)"
+                NSLog("[\(CcidAudioBridge.tag)] \u{26A0}\u{FE0F} \(lastReason)")
+                continue
+            }
+
             card.useExtendedLength = false
             card.useCommandChaining = false
 
+            let okBox = Box<Bool>(false)
+            let errBox = Box<Error?>(nil)
             let sessionSem = DispatchSemaphore(value: 0)
-            var ok = false
             card.beginSession { success, error in
-                if let error = error {
-                    NSLog("[\(CcidAudioBridge.tag)] beginSession error: \(error)")
-                }
-                ok = success
+                okBox.set(success)
+                errBox.set(error)
                 sessionSem.signal()
             }
-            sessionSem.wait()
 
-            if ok {
-                sessionActive = true
-                NSLog("[\(CcidAudioBridge.tag)] Connected to slot: \(slotName)")
-                return true
+            // Bounded wait: another TKSmartCard holding the card (e.g. a signing
+            // session that was not closed) makes beginSession queue indefinitely.
+            // An unbounded wait here hung whichever thread called connect().
+            if sessionSem.wait(timeout: .now() + 5.0) == .timedOut {
+                lastReason = "beginSession(\(slotName)) timed out — card busy in another session?"
+                NSLog("[\(CcidAudioBridge.tag)] \u{26A0}\u{FE0F} \(lastReason)")
+                card.endSession()
+                continue
             }
+
+            if let error = errBox.get() {
+                lastReason = "beginSession(\(slotName)) error: \(error.localizedDescription)"
+                NSLog("[\(CcidAudioBridge.tag)] beginSession error: \(error)")
+                continue
+            }
+
+            guard okBox.get() else {
+                lastReason = "beginSession(\(slotName)) returned false"
+                NSLog("[\(CcidAudioBridge.tag)] \u{26A0}\u{FE0F} \(lastReason)")
+                continue
+            }
+
+            smartCard = card
+            sessionActive = true
+            lastConnectError = ""
+            NSLog("[\(CcidAudioBridge.tag)] Connected to slot: \(slotName) (attempt \(attempt))")
+            return true
         }
 
+        lastConnectError = lastReason
         return false
     }
 
+    private static func describe(_ state: TKSmartCardSlot.State) -> String {
+        switch state {
+        case .missing:   return "missing"
+        case .empty:     return "empty"
+        case .probing:   return "probing"
+        case .muteCard:  return "muteCard"
+        case .validCard: return "validCard"
+        @unknown default: return "unknown(\(state.rawValue))"
+        }
+    }
     func disconnect() {
         stopStream()
         if sessionActive {
@@ -174,8 +266,9 @@ class CcidAudioBridge {
         // Brief pause to let CryptoTokenKit settle after route change
         Thread.sleep(forTimeInterval: 0.1)
 
-        // Try to connect fresh
-        if connect() {
+        // Try to connect fresh. Fewer attempts than a cold start: the polling
+        // loop wraps this in its own reconnect retries.
+        if connect(maxAttempts: 4) {
             NSLog("[\(CcidAudioBridge.tag)] ✅ Smart card reconnected")
             // Re-start firmware stream
             if startStream() {
@@ -352,5 +445,29 @@ class CcidAudioBridge {
     /// Stop polling (for API compat, calls stopStream internally).
     func stopPolling() {
         // streaming = false is set in stopStream()
+    }
+}
+
+/// Minimal thread-safe box.
+///
+/// Semaphore waits in `connect()` are bounded, so a CryptoTokenKit callback can
+/// still fire after we gave up waiting. Writing to a captured `var` from that
+/// late callback while the caller reads it is a data race; this serialises it.
+private final class Box<T> {
+    private let lock = NSLock()
+    private var value: T
+
+    init(_ value: T) { self.value = value }
+
+    func set(_ newValue: T) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }

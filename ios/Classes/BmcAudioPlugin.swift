@@ -35,6 +35,16 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
     // MARK: - CCID Audio Bridge (bit-exact encrypted PCM for iOS)
     private let ccidBridge = CcidAudioBridge()
 
+    /// Smart card connect runs here, never on the Flutter platform thread —
+    /// connect() retries for seconds while iOS re-probes the card.
+    private let ccidConnectQueue = DispatchQueue(label: "com.bmc.audio.ccid.connect",
+                                                 qos: .userInitiated)
+
+    /// Invalidates an in-flight CCID start. Bumped by every start and every stop,
+    /// so a capture whose connect was still running when the call ended does not
+    /// come back to life and hold the mic and the card.
+    private var ccidStartToken = 0
+
     // MARK: - Plugin Registration
     public static func register(with registrar: FlutterPluginRegistrar) {
         let instance = BmcAudioPlugin()
@@ -740,17 +750,57 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
         NSLog("BmcAudioPlugin: CCID: Starting capture...")
 
-        // Connect to smart card (always reconnect fresh to handle device removal)
-        ccidBridge.disconnect()
-        NSLog("BmcAudioPlugin: CCID: Connecting to smart card...")
-        guard ccidBridge.connect() else {
-            NSLog("BmcAudioPlugin: CCID connect failed — no smart card slot found")
-            result(FlutterError(code: "CCID_CONNECT_FAILED",
-                                message: "Could not connect to smart card", details: nil))
-            return
-        }
-        NSLog("BmcAudioPlugin: CCID: ✓ Smart card connected")
+        ccidStartToken += 1
+        let startToken = ccidStartToken
 
+        // Connect to smart card (always reconnect fresh to handle device removal).
+        // connect() now retries for a few seconds — the CCID slot is momentarily
+        // unusable while iOS re-attaches the composite device, which is exactly
+        // what happens when a call starts with the S-USB already plugged in.
+        // Those retries must not run on the platform thread: blocking it freezes
+        // the Flutter UI (the whole call screen) for the retry window.
+        ccidConnectQueue.async { [weak self] in
+            guard let self = self else {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "CCID_CONNECT_FAILED",
+                                        message: "Plugin released", details: nil))
+                }
+                return
+            }
+
+            self.ccidBridge.disconnect()
+            NSLog("BmcAudioPlugin: CCID: Connecting to smart card...")
+            let connected = self.ccidBridge.connect()
+            let reason = self.ccidBridge.lastConnectError
+
+            DispatchQueue.main.async {
+                // Call ended (or another start began) while we were connecting.
+                guard startToken == self.ccidStartToken else {
+                    NSLog("BmcAudioPlugin: CCID: start superseded while connecting — releasing card")
+                    self.ccidBridge.disconnect()
+                    result(FlutterError(code: "CCID_CANCELLED",
+                                        message: "Capture was stopped while connecting",
+                                        details: nil))
+                    return
+                }
+
+                guard connected else {
+                    NSLog("BmcAudioPlugin: CCID connect failed — \(reason)")
+                    result(FlutterError(code: "CCID_CONNECT_FAILED",
+                                        message: "Could not connect to smart card: \(reason)",
+                                        details: reason))
+                    return
+                }
+                NSLog("BmcAudioPlugin: CCID: ✓ Smart card connected")
+                self.startCcidCaptureAfterConnect(result: result)
+            }
+        }
+    }
+
+    /// Second half of `startCcidCapture`, once the smart card session is open:
+    /// bring the UAC endpoint up, start the firmware stream and begin polling.
+    /// Runs on the main thread (AVAudioEngine setup).
+    private func startCcidCaptureAfterConnect(result: @escaping FlutterResult) {
         // Check status before starting
         if let status = ccidBridge.getStatus() {
             NSLog("BmcAudioPlugin: CCID status before start: avail=\(status.avail) rate=\(status.sampleRate) enc=\(status.encrypted) streaming=\(status.streaming)")
@@ -864,6 +914,10 @@ public class BmcAudioPlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
 
     /// Stop CCID audio capture.
     private func stopCcidCapture() {
+        // Invalidate any start still waiting on connect() — must happen before the
+        // guard below, which returns early exactly while a start is in flight.
+        ccidStartToken += 1
+
         // Callers routinely stop a capture that was never started — the Dart side
         // resets the decoder before every call. Tearing the audio session down in
         // that case deactivates a session CallKit owns, which drops the USB port
